@@ -106,6 +106,33 @@ python3 check_specific_emails.py
 python3 check_deleted_user.py
 ```
 
+## 🌟 Real-World Example Sequence
+
+### Real Project Example
+```bash
+# Step 1: Unit routing and testing with real project data
+python scripts/automation/unified_unit_routing_and_testing_script.py \
+  --mode combined \
+  --project-id "83d4a405-cd08-4895-af71-d8e6b7f953b2" \
+  --csv "backups/single_contributor_test.csv" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
+  --single-unit
+
+# Step 2: Delete contributors with real configuration
+python scripts/api-testing/delete_contributors_csv.py \
+  --csv backups/single_contributor_test.csv \
+  --config ~/config_integration.ini \
+  --integration \
+  --execute \
+  --skip-redis
+```
+
+### What This Real Example Does:
+1. **Unit Routing**: Routes units to the specified job using real project ID `83d4a405-cd08-4895-af71-d8e6b7f953b2`
+2. **API Testing**: Tests fetch/commit APIs with the real job URL
+3. **Contributor Deletion**: Deletes contributors from all systems using integration environment
+4. **Redis Skip**: Skips Redis session clearing (useful for testing environments)
+
 ## 🔍 Verification Commands
 
 ### Check Specific Emails

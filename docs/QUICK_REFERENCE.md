@@ -58,7 +58,7 @@ python3 scripts/delete_contributors_csv.py \
 # Test before deletion
 python3 scripts/test_fetch_commit_apis.py \
   --csv "backups/inactive_contributors_10.csv" \
-  --job-url "https://client.appen.com/quality/jobs/27f196f6-ee10-49ae-b8d1-8b983cd6f2ea?secret=mnbCcSEUWCwownwiLkv0z7iZ7raK3JbqlSCBzFGqDWMGCO" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
   --config ~/config_integration.ini \
   --integration \
   --sample-size 3
@@ -66,7 +66,7 @@ python3 scripts/test_fetch_commit_apis.py \
 # Test after deletion (should fail)
 python3 scripts/test_fetch_commit_apis.py \
   --csv "backups/inactive_contributors_10.csv" \
-  --job-url "https://client.appen.com/quality/jobs/27f196f6-ee10-49ae-b8d1-8b983cd6f2ea?secret=mnbCcSEUWCwownwiLkv0z7iZ7raK3JbqlSCBzFGqDWMGCO" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
   --config ~/config_integration.ini \
   --integration \
   --sample-size 3 \
@@ -77,9 +77,28 @@ python3 scripts/test_fetch_commit_apis.py \
 ```bash
 python3 comprehensive_testing_workflow.py \
   --project-id "fe92bf1f-46c3-4ebb-a09e-0557237f41e6" \
-  --job-url "https://client.appen.com/quality/jobs/27f196f6-ee10-49ae-b8d1-8b983cd6f2ea?secret=mnbCcSEUWCwownwiLkv0z7iZ7raK3JbqlSCBzFGqDWMGCO" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
   --csv "backups/inactive_contributors_10.csv" \
   --config ~/config_integration.ini
+```
+
+### 5. Unit Routing and Testing (Real Example)
+```bash
+# Combined unit routing and testing
+python scripts/unified_unit_routing_and_testing_script.py \
+  --mode combined \
+  --project-id "83d4a405-cd08-4895-af71-d8e6b7f953b2" \
+  --csv "backups/single_contributor_test.csv" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
+  --single-unit
+
+# Delete contributors (real example)
+python scripts/delete_contributors_csv.py \
+  --csv backups/single_contributor_test.csv \
+  --config ~/config_integration.ini \
+  --integration \
+  --execute \
+  --skip-redis
 ```
 
 ## 🔍 Verification Commands

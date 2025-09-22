@@ -254,7 +254,7 @@ CONTRIB_456,user2@example.com,Jane Smith
 
 ### Example Job URL
 ```
-https://client.appen.com/quality/jobs/JOB_ID?secret=SECRET_KEY
+https://account.integration.cf3.us/quality/tasks/TASK_ID?secret=SECRET_KEY
 ```
 
 ### Common Workflows
@@ -276,7 +276,7 @@ python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_con
 # Run complete workflow with verification
 python scripts/automation/comprehensive_testing_workflow.py \
   --project-id "your-project-id" \
-  --job-url "your-job-url" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/TASK_ID?secret=SECRET_KEY" \
   --csv "contributors.csv" \
   --config "~/config_integration.ini"
 ```
@@ -289,6 +289,25 @@ python scripts/automation/comprehensive_testing_workflow.py \
 
 # Using Python script
 python scripts/automation/run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
+```
+
+#### 4. Unit Routing and Testing (Real Example)
+```bash
+# Combined unit routing and testing with real project data
+python scripts/automation/unified_unit_routing_and_testing_script.py \
+  --mode combined \
+  --project-id "83d4a405-cd08-4895-af71-d8e6b7f953b2" \
+  --csv "backups/single_contributor_test.csv" \
+  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
+  --single-unit
+
+# Delete contributors with real configuration
+python scripts/api-testing/delete_contributors_csv.py \
+  --csv backups/single_contributor_test.csv \
+  --config ~/config_integration.ini \
+  --integration \
+  --execute \
+  --skip-redis
 ```
 
 ## Troubleshooting
