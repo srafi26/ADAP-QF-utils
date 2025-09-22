@@ -35,6 +35,40 @@ Tests the fetch and commit APIs for contributors to verify they can access the s
 - Verifies if deleted contributors can still access the system
 - Useful for testing contributor deletion system integrity
 
+#### `delete_contributors_csv.py`
+Comprehensive contributor deletion script that removes contributor data from multiple systems.
+
+**Purpose:**
+- Deletes contributors from PostgreSQL database
+- Masks PII data in Elasticsearch (Unit View & Judgment View)
+- Masks analytics data in ClickHouse
+- Clears Redis sessions and caches
+- Deletes S3 files associated with contributors
+- Provides comprehensive logging and backup functionality
+
+**Usage:**
+```bash
+# Dry run to see what would be deleted
+python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config.ini --dry-run
+
+# Execute actual deletion
+python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config.ini --execute
+
+# Use integration environment
+python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config_integration.ini --integration --execute
+
+# Skip Redis session clearing
+python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config.ini --execute --skip-redis
+```
+
+**Options:**
+- `--csv`: CSV file containing contributor data (required)
+- `--config`: Configuration file path (required)
+- `--integration`: Use integration environment settings
+- `--dry-run`: Perform dry run without actual deletion
+- `--execute`: Execute actual deletion (overrides dry-run)
+- `--skip-redis`: Skip Redis session clearing (optional)
+
 **Usage:**
 ```bash
 # Test with CSV file
