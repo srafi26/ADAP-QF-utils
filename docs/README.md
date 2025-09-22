@@ -37,9 +37,6 @@ This directory contains comprehensive documentation for the ADAP Quality Framewo
 - **`manual_clickhouse_masking.py`** - Manual ClickHouse data masking
 
 ### Automation Scripts (`scripts/automation/`)
-- **`comprehensive_testing_workflow.py`** - Complete end-to-end testing workflow
-- **`run_deletion.py`** - Simple deletion runner script
-- **`run_deletion.sh`** - Shell script wrapper for deletion
 - **`example_workflow.sh`** - Example workflow script
 - **`unified_unit_routing_and_testing_script.py`** - Unit routing automation
 
@@ -67,17 +64,7 @@ python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_con
 python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --execute
 ```
 
-### 2. Simple Deletion (No Job URLs Required)
-```bash
-# Using shell script (easiest)
-./scripts/automation/run_deletion.sh --dry-run --sample-size 5
-./scripts/automation/run_deletion.sh --execute --sample-size 10
-
-# Using Python script
-python scripts/automation/run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
-```
-
-### 3. Unit Routing and Testing (Real Example)
+### 2. Unit Routing and Testing (Real Example)
 ```bash
 # Combined unit routing and testing with real project data
 python scripts/automation/unified_unit_routing_and_testing_script.py \

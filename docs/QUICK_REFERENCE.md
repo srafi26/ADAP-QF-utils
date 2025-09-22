@@ -73,16 +73,7 @@ python3 scripts/test_fetch_commit_apis.py \
   --fetch-only
 ```
 
-### 4. Complete Workflow
-```bash
-python3 comprehensive_testing_workflow.py \
-  --project-id "fe92bf1f-46c3-4ebb-a09e-0557237f41e6" \
-  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
-  --csv "backups/inactive_contributors_10.csv" \
-  --config ~/config_integration.ini
-```
-
-### 5. Unit Routing and Testing (Real Example)
+### 4. Unit Routing and Testing (Real Example)
 ```bash
 # Combined unit routing and testing
 python scripts/unified_unit_routing_and_testing_script.py \

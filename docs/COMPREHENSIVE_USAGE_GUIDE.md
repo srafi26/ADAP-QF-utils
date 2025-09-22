@@ -80,16 +80,7 @@ pip install -r requirements.txt
 
 ## 📜 Scripts Overview
 
-### 1. `comprehensive_testing_workflow.py` (Main Workflow)
-**Purpose**: Complete end-to-end testing workflow
-**Features**:
-- Unit routing to jobs
-- Pre-deletion API testing
-- Contributor deletion
-- Post-deletion verification
-- Elasticsearch/ClickHouse validation
-
-### 2. `scripts/delete_contributors_csv.py` (Core Deletion)
+### 1. `scripts/delete_contributors_csv.py` (Core Deletion)
 **Purpose**: Main contributor deletion script
 **Features**:
 - Multi-system deletion/masking
@@ -208,25 +199,7 @@ curl -s "http://localhost:8123/ping"
 
 ## 🚀 Usage Examples
 
-### 1. Complete Testing Workflow
-
-#### Basic Usage
-```bash
-python3 comprehensive_testing_workflow.py \
-  --project-id "fe92bf1f-46c3-4ebb-a09e-0557237f41e6" \
-  --job-url "https://account.integration.cf3.us/quality/tasks/7e7e0b6d-c0ba-47e3-86a3-fd5e1b5dd468?secret=jFJFscUqSotzavqU7dIk8tk16kXgC7mtnoB8B8mXGFfCZU" \
-  --csv "backups/inactive_contributors_10.csv" \
-  --config "~/config_integration.ini"
-```
-
-#### What This Does:
-1. **Unit Routing**: Routes units to the specified job
-2. **Pre-Deletion Testing**: Tests fetch/commit APIs
-3. **Contributor Deletion**: Deletes contributors from all systems
-4. **Post-Deletion Testing**: Verifies contributors are kicked out
-5. **Verification**: Confirms "DELETED_USER" appears in data sources
-
-### 2. Fetch Inactive Contributors
+### 1. Fetch Inactive Contributors
 
 #### Dry Run (Safe)
 ```bash
@@ -254,7 +227,7 @@ python3 scripts/fetch_inactive_contributors.py \
   --execute
 ```
 
-### 3. Delete Contributors from CSV
+### 2. Delete Contributors from CSV
 
 #### Dry Run (Recommended First)
 ```bash
@@ -274,7 +247,7 @@ python3 scripts/delete_contributors_csv.py \
   --execute
 ```
 
-### 4. Test Fetch/Commit APIs
+### 3. Test Fetch/Commit APIs
 
 #### Test Before Deletion
 ```bash
@@ -297,7 +270,7 @@ python3 scripts/test_fetch_commit_apis.py \
   --fetch-only
 ```
 
-### 5. Unit Routing and Testing (Real Example)
+### 4. Unit Routing and Testing (Real Example)
 
 #### Combined Unit Routing and Testing
 ```bash
@@ -321,23 +294,7 @@ python scripts/delete_contributors_csv.py \
 
 ## 🧪 Testing Workflows
 
-### 1. Complete End-to-End Test
-```bash
-# Step 1: Fetch inactive contributors
-python3 scripts/fetch_inactive_contributors.py \
-  --config ~/config_integration.ini \
-  --integration \
-  --execute
-
-# Step 2: Run complete workflow
-python3 comprehensive_testing_workflow.py \
-  --project-id "your-project-id" \
-  --job-url "https://account.integration.cf3.us/quality/tasks/TASK_ID?secret=SECRET_KEY" \
-  --csv "inactive_contributors_$(date +%Y%m%d_%H%M%S).csv" \
-  --config ~/config_integration.ini
-```
-
-### 2. Individual Component Testing
+### 1. Individual Component Testing
 ```bash
 # Test ClickHouse connectivity
 source setup_clickhouse_env.sh
@@ -358,7 +315,7 @@ conn.close()
 "
 ```
 
-### 3. Verification Testing
+### 2. Verification Testing
 ```bash
 # Verify Elasticsearch masking
 curl -s -X GET "https://vpc-kepler-es-integration-v1-gsffeklbxeuvx3zx5t3qm3xht4.us-east-1.es.amazonaws.com/project-your-project-id/_search" \

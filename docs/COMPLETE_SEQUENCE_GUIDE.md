@@ -14,48 +14,36 @@
 ./run_deletion.sh --execute --skip-redis
 ```
 
-### Option 2: Python Script
+### Option 2: Direct Script Usage
 ```bash
-# Test with 5 contributors (safe dry-run)
-python3 run_deletion.py --config ~/config_integration.ini --integration --sample-size 5
+# Fetch inactive contributors
+python3 scripts/fetch_inactive_contributors.py --config ~/config_integration.ini --integration --execute
 
-# Actually delete 10 contributors
-python3 run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
-```
+# Delete contributors (dry-run first!)
+python3 scripts/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --dry-run
 
-### Option 3: Complete Workflow (Advanced)
-```bash
-# Full workflow with verification
-python3 complete_contributor_deletion_workflow.py --config ~/config_integration.ini --integration --execute --sample-size 10
+# Execute deletion
+python3 scripts/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --execute
 ```
 
 ## 📋 What Each Script Does
 
-### 1. `run_deletion.sh` (Shell Script - Easiest)
-- **Purpose**: Simple wrapper for the deletion process
-- **Features**: 
-  - Colored output
-  - Safety confirmations
-  - Error handling
-  - No job URLs required
-- **Usage**: `./run_deletion.sh --dry-run --sample-size 5`
-
-### 2. `run_deletion.py` (Python Script - Direct)
-- **Purpose**: Direct Python execution of deletion process
+### 1. `fetch_inactive_contributors.py` (Data Fetching)
+- **Purpose**: Fetch inactive contributors from database
 - **Features**:
-  - Fetches inactive contributors automatically
-  - Deletes from all data sources
-  - No job URLs required
-- **Usage**: `python3 run_deletion.py --config ~/config_integration.ini --integration --execute`
+  - PostgreSQL querying
+  - CSV export
+  - Configurable criteria
+- **Usage**: `python3 scripts/fetch_inactive_contributors.py --config ~/config_integration.ini --integration --execute`
 
-### 3. `complete_contributor_deletion_workflow.py` (Advanced)
-- **Purpose**: Full workflow with verification
+### 2. `delete_contributors_csv.py` (Core Deletion)
+- **Purpose**: Main contributor deletion script
 - **Features**:
-  - Fetches inactive contributors
-  - Deletes from all data sources
-  - Verifies deletion worked
+  - Multi-system deletion/masking
   - Comprehensive logging
-- **Usage**: `python3 complete_contributor_deletion_workflow.py --config ~/config_integration.ini --integration --execute`
+  - Dry-run mode
+  - Error handling and recovery
+- **Usage**: `python3 scripts/delete_contributors_csv.py --csv contributors.csv --config ~/config_integration.ini --integration --execute`
 
 ## 🔧 Individual Scripts (If You Need Them)
 
