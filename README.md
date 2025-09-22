@@ -22,9 +22,24 @@ ADAP-QF-utils/
 └── README.md                # This file
 ```
 
+## 📚 Documentation
+
+### Comprehensive Documentation
+- **[docs/README.md](docs/README.md)** - Complete documentation index and overview
+- **[docs/COMPREHENSIVE_USAGE_GUIDE.md](docs/COMPREHENSIVE_USAGE_GUIDE.md)** - Detailed usage guide with examples and troubleshooting
+- **[docs/COMPLETE_SEQUENCE_GUIDE.md](docs/COMPLETE_SEQUENCE_GUIDE.md)** - Step-by-step sequence guide for contributor deletion
+- **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** - Quick reference for common commands and operations
+- **[docs/system-architecture.md](docs/system-architecture.md)** - System architecture diagrams and component overview
+- **[docs/workflow-diagram.md](docs/workflow-diagram.md)** - Detailed workflow diagrams for all processes
+
+### Quick Start
+1. **New Users**: Start with [docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)
+2. **Step-by-Step**: Follow [docs/COMPLETE_SEQUENCE_GUIDE.md](docs/COMPLETE_SEQUENCE_GUIDE.md)
+3. **Detailed Info**: Read [docs/COMPREHENSIVE_USAGE_GUIDE.md](docs/COMPREHENSIVE_USAGE_GUIDE.md)
+
 ## Available Scripts
 
-### API Testing Scripts
+### API Testing Scripts (`scripts/api-testing/`)
 
 #### `test_fetch_commit_apis.py`
 Tests the fetch and commit APIs for contributors to verify they can access the system.
@@ -45,6 +60,56 @@ Comprehensive contributor deletion script that removes contributor data from mul
 - Clears Redis sessions and caches
 - Deletes S3 files associated with contributors
 - Provides comprehensive logging and backup functionality
+
+#### `fetch_inactive_contributors.py`
+Fetches inactive contributors from the PostgreSQL database for deletion.
+
+**Purpose:**
+- Queries PostgreSQL for inactive contributors
+- Exports results to CSV format
+- Configurable criteria (days inactive, project count, etc.)
+- Safe dry-run mode for testing
+
+### Data Processing Scripts (`scripts/data-processing/`)
+
+#### `manual_elasticsearch_masking.py`
+Manual Elasticsearch data masking utility for specific contributor data.
+
+#### `manual_clickhouse_masking.py`
+Manual ClickHouse data masking utility for analytics data.
+
+### Automation Scripts (`scripts/automation/`)
+
+#### `comprehensive_testing_workflow.py`
+Complete end-to-end testing workflow for contributor deletion.
+
+**Purpose:**
+- Unit routing to jobs
+- Pre-deletion API testing
+- Contributor deletion
+- Post-deletion verification
+- Elasticsearch/ClickHouse validation
+
+#### `run_deletion.py`
+Simple contributor deletion runner script.
+
+**Purpose:**
+- Fetches inactive contributors automatically
+- Deletes from all data sources
+- No job URLs required
+- Easy-to-use interface
+
+#### `run_deletion.sh`
+Shell script wrapper for contributor deletion.
+
+**Purpose:**
+- Colored output
+- Safety confirmations
+- Error handling
+- No job URLs required
+
+#### `unified_unit_routing_and_testing_script.py`
+Unit routing automation script for testing workflows.
 
 **Usage:**
 ```bash
@@ -172,6 +237,14 @@ When adding new scripts, please follow these guidelines:
 
 ## Examples
 
+### Configuration Examples (`examples/config/`)
+- **`config_example.ini`** - Development environment configuration template
+- **`config_integration_example.ini`** - Integration environment configuration template
+
+### Setup Scripts (`examples/`)
+- **`setup_clickhouse_env.sh`** - ClickHouse environment setup script
+- **`contributors_example.csv`** - Example CSV format for contributor data
+
 ### Example CSV for API Testing
 ```csv
 contributor_id,email_address,name
@@ -182,6 +255,40 @@ CONTRIB_456,user2@example.com,Jane Smith
 ### Example Job URL
 ```
 https://client.appen.com/quality/jobs/JOB_ID?secret=SECRET_KEY
+```
+
+### Common Workflows
+
+#### 1. Simple Contributor Deletion
+```bash
+# Fetch inactive contributors
+python scripts/api-testing/fetch_inactive_contributors.py --config ~/config_integration.ini --integration --execute
+
+# Delete contributors (dry-run first!)
+python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --dry-run
+
+# Execute deletion
+python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --execute
+```
+
+#### 2. Complete Testing Workflow
+```bash
+# Run complete workflow with verification
+python scripts/automation/comprehensive_testing_workflow.py \
+  --project-id "your-project-id" \
+  --job-url "your-job-url" \
+  --csv "contributors.csv" \
+  --config "~/config_integration.ini"
+```
+
+#### 3. Simple Deletion (No Job URLs Required)
+```bash
+# Using shell script (easiest)
+./scripts/automation/run_deletion.sh --dry-run --sample-size 5
+./scripts/automation/run_deletion.sh --execute --sample-size 10
+
+# Using Python script
+python scripts/automation/run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
 ```
 
 ## Troubleshooting

@@ -1,0 +1,211 @@
+# Complete Contributor Deletion Sequence Guide
+
+## 🚀 Quick Start (No Job URLs Required)
+
+### Option 1: Simple Shell Script (Recommended)
+```bash
+# Test with 5 contributors (safe dry-run)
+./run_deletion.sh --dry-run --sample-size 5
+
+# Actually delete 10 contributors
+./run_deletion.sh --execute --sample-size 10
+
+# Delete without Redis clearing
+./run_deletion.sh --execute --skip-redis
+```
+
+### Option 2: Python Script
+```bash
+# Test with 5 contributors (safe dry-run)
+python3 run_deletion.py --config ~/config_integration.ini --integration --sample-size 5
+
+# Actually delete 10 contributors
+python3 run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
+```
+
+### Option 3: Complete Workflow (Advanced)
+```bash
+# Full workflow with verification
+python3 complete_contributor_deletion_workflow.py --config ~/config_integration.ini --integration --execute --sample-size 10
+```
+
+## 📋 What Each Script Does
+
+### 1. `run_deletion.sh` (Shell Script - Easiest)
+- **Purpose**: Simple wrapper for the deletion process
+- **Features**: 
+  - Colored output
+  - Safety confirmations
+  - Error handling
+  - No job URLs required
+- **Usage**: `./run_deletion.sh --dry-run --sample-size 5`
+
+### 2. `run_deletion.py` (Python Script - Direct)
+- **Purpose**: Direct Python execution of deletion process
+- **Features**:
+  - Fetches inactive contributors automatically
+  - Deletes from all data sources
+  - No job URLs required
+- **Usage**: `python3 run_deletion.py --config ~/config_integration.ini --integration --execute`
+
+### 3. `complete_contributor_deletion_workflow.py` (Advanced)
+- **Purpose**: Full workflow with verification
+- **Features**:
+  - Fetches inactive contributors
+  - Deletes from all data sources
+  - Verifies deletion worked
+  - Comprehensive logging
+- **Usage**: `python3 complete_contributor_deletion_workflow.py --config ~/config_integration.ini --integration --execute`
+
+## 🔧 Individual Scripts (If You Need Them)
+
+### Fetch Inactive Contributors
+```bash
+python3 scripts/fetch_inactive_contributors.py \
+  --config ~/config_integration.ini \
+  --integration \
+  --execute \
+  --sample-size 10
+```
+
+### Delete Contributors from CSV
+```bash
+python3 scripts/delete_contributors_csv.py \
+  --csv "backups/inactive_contributors_YYYYMMDD_HHMMSS.csv" \
+  --config ~/config_integration.ini \
+  --integration \
+  --execute
+```
+
+### Test APIs (Optional - No Job URLs Required)
+```bash
+python3 scripts/test_fetch_commit_apis.py \
+  --csv "backups/inactive_contributors_YYYYMMDD_HHMMSS.csv"
+```
+
+## 🎯 Complete Sequence (Step by Step)
+
+### Step 1: Test the Process (Safe)
+```bash
+# Test with a small number of contributors
+./run_deletion.sh --dry-run --sample-size 3
+```
+
+### Step 2: Run Actual Deletion
+```bash
+# Delete contributors (will ask for confirmation)
+./run_deletion.sh --execute --sample-size 10
+```
+
+### Step 3: Verify Results
+```bash
+# Check if emails are still visible (should show "not found")
+python3 check_specific_emails.py
+
+# Check if DELETED_USER entries exist (should show some results)
+python3 check_deleted_user.py
+```
+
+## 🔍 Verification Commands
+
+### Check Specific Emails
+```bash
+# Check if specific emails are still visible
+python3 check_specific_emails.py
+```
+
+### Check DELETED_USER Entries
+```bash
+# Check if masking worked (should find DELETED_USER entries)
+python3 check_deleted_user.py
+```
+
+### Check Project Indices
+```bash
+# Check project-specific indices for email visibility
+python3 check_project_indices.py
+```
+
+## ⚙️ Configuration
+
+### Required Files
+- `~/config_integration.ini` - Configuration file with database and service URLs
+- `scripts/` directory - Contains all the deletion scripts
+
+### Optional Arguments
+- `--sample-size N` - Number of contributors to process (default: 10)
+- `--skip-redis` - Skip Redis session clearing
+- `--execute` - Actually perform deletion (without this, it's dry-run)
+
+## 🚨 Safety Features
+
+### Dry Run Mode
+- **Default behavior**: All scripts run in dry-run mode unless `--execute` is specified
+- **Safe testing**: You can test with `--dry-run` to see what would happen
+- **No data loss**: Dry-run mode doesn't actually delete anything
+
+### Confirmation Prompts
+- **Shell script**: Asks for confirmation before actual deletion
+- **Sample size**: Start with small numbers (3-5) for testing
+- **Backup creation**: Scripts automatically create CSV backups
+
+## 📊 What Gets Deleted/Masked
+
+### PostgreSQL
+- ✅ Contributor records deleted
+- ✅ Job mappings deleted (prevents platform access)
+- ✅ PII data masked with "DELETED_USER"
+
+### Elasticsearch
+- ✅ Email addresses masked with "DELETED_USER" in project indices
+- ✅ Worker IDs masked with "DELETED_USER"
+- ✅ All nested email fields masked
+
+### ClickHouse
+- ✅ Email addresses masked with "DELETED_USER"
+- ✅ Handles Kafka table engine gracefully
+
+### Redis (Optional)
+- ✅ Session data cleared (can be skipped with `--skip-redis`)
+
+### S3
+- ✅ Files containing contributor IDs deleted
+
+## 🔧 Troubleshooting
+
+### Common Issues
+1. **"No contributors found"**: Try increasing `--sample-size`
+2. **"Config file not found"**: Ensure `~/config_integration.ini` exists
+3. **"Permission denied"**: Run `chmod +x run_deletion.sh`
+
+### Logs
+- All scripts create detailed logs in the `logs/` directory
+- Check logs for detailed error information
+
+## 📝 Example Complete Workflow
+
+```bash
+# 1. Test with 3 contributors (safe)
+./run_deletion.sh --dry-run --sample-size 3
+
+# 2. If test looks good, delete 10 contributors
+./run_deletion.sh --execute --sample-size 10
+
+# 3. Verify deletion worked
+python3 check_specific_emails.py
+
+# 4. Check if masking worked
+python3 check_deleted_user.py
+```
+
+## 🎉 Success Indicators
+
+- ✅ Script completes without errors
+- ✅ Original emails not found in Elasticsearch
+- ✅ DELETED_USER entries found in Elasticsearch
+- ✅ Contributors cannot access the platform
+- ✅ Logs show successful deletion/masking
+
+---
+
+**Note**: This system is designed to work without requiring job URLs. It automatically fetches inactive contributors and deletes them from all relevant data sources.
