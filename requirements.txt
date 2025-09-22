@@ -1,0 +1,33 @@
+# ADAP-QF-utils - Python Dependencies
+# Core dependencies for utility scripts
+
+# HTTP requests
+requests>=2.31.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# CSV and data handling
+openpyxl>=3.1.0
+
+# Logging and configuration
+pyyaml>=6.0
+
+# Date/time handling
+python-dateutil>=2.8.0
+
+# CLI argument parsing (built-in argparse is used, but click is available for more complex CLIs)
+click>=8.1.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Development tools
+pre-commit>=3.3.0
