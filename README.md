@@ -271,17 +271,7 @@ python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_con
 python scripts/api-testing/delete_contributors_csv.py --csv backups/inactive_contributors_*.csv --config ~/config_integration.ini --integration --execute
 ```
 
-#### 2. Complete Testing Workflow
-```bash
-# Run complete workflow with verification
-python scripts/automation/comprehensive_testing_workflow.py \
-  --project-id "your-project-id" \
-  --job-url "https://account.integration.cf3.us/quality/tasks/TASK_ID?secret=SECRET_KEY" \
-  --csv "contributors.csv" \
-  --config "~/config_integration.ini"
-```
-
-#### 3. Simple Deletion (No Job URLs Required)
+#### 2. Simple Deletion (No Job URLs Required)
 ```bash
 # Using shell script (easiest)
 ./scripts/automation/run_deletion.sh --dry-run --sample-size 5
@@ -291,7 +281,7 @@ python scripts/automation/comprehensive_testing_workflow.py \
 python scripts/automation/run_deletion.py --config ~/config_integration.ini --integration --execute --sample-size 10
 ```
 
-#### 4. Unit Routing and Testing (Real Example)
+#### 3. Unit Routing and Testing (Real Example)
 ```bash
 # Combined unit routing and testing with real project data
 python scripts/automation/unified_unit_routing_and_testing_script.py \
