@@ -43,6 +43,8 @@ import redis
 import boto3
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass
@@ -84,6 +86,24 @@ class DeletionStats:
     clickhouse_records_masked: int = 0
     pii_masked_records: int = 0
 
+class ThreadSafeCounter:
+    """Thread-safe counter for tracking operations across multiple threads"""
+    def __init__(self):
+        self._value = 0
+        self._lock = threading.Lock()
+    
+    def increment(self, amount=1):
+        with self._lock:
+            self._value += amount
+    
+    def get_value(self):
+        with self._lock:
+            return self._value
+    
+    def reset(self):
+        with self._lock:
+            self._value = 0
+
 class CSVContributorDeleter:
     """Deletes contributors from CSV file"""
     
@@ -95,6 +115,11 @@ class CSVContributorDeleter:
         self.config = configparser.ConfigParser()
         self.config.read(os.path.expanduser(config_file))
         self.stats = DeletionStats()
+        
+        # Thread-safe counters for concurrent operations
+        self.elasticsearch_counter = ThreadSafeCounter()
+        self.clickhouse_counter = ThreadSafeCounter()
+        self.postgresql_counter = ThreadSafeCounter()
         
         # Database connections
         self.postgres_conn = None
@@ -194,9 +219,9 @@ class CSVContributorDeleter:
         logger.info(f"Successfully saved contributors to: {filepath}")
         return filepath
     
-    def get_postgres_connection(self):
+    def get_postgres_connection(self, force_fresh=False):
         """Get PostgreSQL connection"""
-        if not self.postgres_conn:
+        if not self.postgres_conn or force_fresh:
             # Always use config file for database connection
             # The integration flag is used for other services (Redis, S3, etc.)
             db_config = {
@@ -461,388 +486,47 @@ class CSVContributorDeleter:
             return []
 
     def mask_elasticsearch_data(self, contributors: List[ContributorInfo]) -> int:
-        """Mask contributor data in Elasticsearch using curl commands with comprehensive field coverage"""
+        """Mask contributor data in Elasticsearch using curl commands with comprehensive field coverage and threading"""
         if self.dry_run:
             logger.info("DRY RUN: Would mask Elasticsearch data")
             return len(contributors)
         
-        logger.info("🔍 COMPREHENSIVE ELASTICSEARCH DATA MASKING")
+        logger.info("🔍 COMPREHENSIVE ELASTICSEARCH DATA MASKING (THREADED)")
         logger.info("=" * 60)
         logger.info(f"Processing {len(contributors)} contributors for Elasticsearch masking")
         logger.debug(f"Contributors to process: {[c.contributor_id for c in contributors]}")
-        masked_docs = 0
-        contributors_processed = 0
         
-        # Get Elasticsearch URL from config file
-        es_url = self.config.get('elasticsearch', 'host', fallback='https://vpc-kepler-es-integration-v1-gsffeklbxeuvx3zx5t3qm3xht4.us-east-1.es.amazonaws.com')
-        if es_url.endswith('/'):
-            es_url = es_url[:-1]
+        # Reset thread-safe counter
+        self.elasticsearch_counter.reset()
         
-        logger.info(f"🌐 Elasticsearch URL: {es_url}")
-        logger.debug(f"Elasticsearch URL configured: {es_url}")
+        # Use threading for better performance
+        max_workers = min(len(contributors), 4)  # Limit to 4 threads to avoid overwhelming ES
+        logger.info(f"🚀 Using {max_workers} threads for Elasticsearch masking")
         
-        try:
-            for contributor in contributors:
-                contributor_id = contributor.contributor_id
-                email = contributor.email_address
-                logger.info(f"🎯 Processing contributor: {contributor_id} (email: {email})")
-                logger.debug(f"Starting comprehensive masking for contributor: {contributor_id}")
-                
-                # Get project IDs for this contributor from PostgreSQL
-                project_ids = self.get_contributor_project_ids(contributor_id)
-                
-                if not project_ids:
-                    logger.warning(f"⚠️  No project IDs found for contributor {contributor_id}, trying fallback Elasticsearch masking")
-                    # Try fallback method: search across all project indices
-                    fallback_masked = self._fallback_elasticsearch_masking(contributor_id, email, es_url)
-                    masked_docs += fallback_masked
-                    contributors_processed += 1
-                    continue
-                
-                # Target project-specific indices (Unit View data is stored here, not in unit-* indices)
-                target_indices = [f"project-{project_id}" for project_id in project_ids]
-                
-                logger.info(f"🎯 Targeting project indices: {target_indices}")
-                logger.debug(f"   Based on project IDs: {project_ids}")
-                logger.debug(f"   Note: Unit View data is stored in project-* indices, not unit-* indices")
-                
-                # Define comprehensive search query for targeted indices and field variations
-                # Based on kepler-app codebase analysis - Unit View data is stored in project-* indices
-                logger.info(f"Creating comprehensive Elasticsearch query for contributor {contributor_id}")
-                query = {
-                    "query": {
-                        "bool": {
-                            "should": [
-                                # Direct field matches
-                                {"term": {"contributor_id": contributor_id}},
-                                {"term": {"worker_id": contributor_id}},
-                                {"term": {"email": email}},
-                                {"term": {"email_address": email}},
-                                {"term": {"worker_email": email}},
-                                {"term": {"lastAnnotatorEmail": email}},
-                                {"term": {"workerEmail": email}},
-                                
-                                # Keyword field matches (exact)
-                                {"term": {"email.keyword": email}},
-                                {"term": {"email_address.keyword": email}},
-                                {"term": {"worker_email.keyword": email}},
-                                {"term": {"lastAnnotatorEmail.keyword": email}},
-                                {"term": {"workerEmail.keyword": email}},
-                                
-                                # Unit View specific fields (from application-column-config-dataset.yml)
-                                {"term": {"latest.lastAnnotatorEmail": email}},
-                                {"term": {"latest.lastAnnotatorEmail.keyword": email}},
-                                {"term": {"latest.workerEmail": email}},
-                                {"term": {"latest.workerEmail.keyword": email}},
-                                {"term": {"latest.lastReviewerEmail": email}},
-                                {"term": {"latest.lastReviewerEmail.keyword": email}},
-                                {"term": {"latest.lastAnnotator": contributor_id}},
-                                {"term": {"latest.workerId": contributor_id}},
-                                
-                                # History array matches
-                                {"term": {"history.workerId": contributor_id}},
-                                {"term": {"history.workerEmail": email}},
-                                {"term": {"history.workerEmail.keyword": email}},
-                                {"term": {"history.lastAnnotatorEmail": email}},
-                                {"term": {"history.lastAnnotatorEmail.keyword": email}},
-                                {"term": {"history.lastAnnotator": contributor_id}},
-                                
-                                # Earliest field matches
-                                {"term": {"earliest.workerId": contributor_id}},
-                                {"term": {"earliest.workerEmail": email}},
-                                {"term": {"earliest.workerEmail.keyword": email}},
-                                {"term": {"earliest.lastAnnotatorEmail": email}},
-                                {"term": {"earliest.lastAnnotatorEmail.keyword": email}},
-                                {"term": {"earliest.lastAnnotator": contributor_id}},
-                                
-                                # QA checker fields
-                                {"term": {"qa_checker_id": contributor_id}},
-                                {"term": {"qa_checker_email": email}},
-                                {"term": {"qa_checker_email.keyword": email}},
-                                
-                                # Wildcard searches for partial matches
-                                {"query_string": {"query": f"*{email}*"}},
-                                {"query_string": {"query": f"*{contributor_id}*"}}
-                            ],
-                            "minimum_should_match": 1
-                        }
-                    }
-                }
-                
-                # Define comprehensive update script covering all field variations
-                script = {
-                    "script": {
-                        "source": """
-                            // Log the operation
-                            ctx._source._masking_log = 'Masked by contributor deletion script at ' + new Date().toString();
-                            
-                            // Direct field masking
-                            if (ctx._source.contributor_id == params.contributor_id) {
-                                ctx._source.contributor_id = 'DELETED_USER';
-                            }
-                            if (ctx._source.worker_id == params.contributor_id) {
-                                ctx._source.worker_id = 'DELETED_USER';
-                            }
-                            if (ctx._source.email == params.email) {
-                                ctx._source.email = 'DELETED_USER';
-                            }
-                            if (ctx._source.email_address == params.email) {
-                                ctx._source.email_address = 'DELETED_USER';
-                            }
-                            if (ctx._source.worker_email == params.email) {
-                                ctx._source.worker_email = 'DELETED_USER';
-                            }
-                            if (ctx._source.lastAnnotatorEmail == params.email) {
-                                ctx._source.lastAnnotatorEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.workerEmail == params.email) {
-                                ctx._source.workerEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.name != null && ctx._source.name != 'DELETED_USER') {
-                                ctx._source.name = 'DELETED_USER';
-                            }
-                            
-                            // Mask nested worker data in latest (Unit View specific fields)
-                            if (ctx._source.latest != null) {
-                                if (ctx._source.latest.workerId == params.contributor_id) {
-                                    ctx._source.latest.workerId = 'DELETED_USER';
-                                }
-                                if (ctx._source.latest.workerEmail == params.email) {
-                                    ctx._source.latest.workerEmail = 'DELETED_USER';
-                                }
-                                if (ctx._source.latest.lastAnnotatorEmail == params.email) {
-                                    ctx._source.latest.lastAnnotatorEmail = 'DELETED_USER';
-                                }
-                                if (ctx._source.latest.lastReviewerEmail == params.email) {
-                                    ctx._source.latest.lastReviewerEmail = 'DELETED_USER';
-                                }
-                                if (ctx._source.latest.lastAnnotator instanceof List) {
-                                    for (int i = 0; i < ctx._source.latest.lastAnnotator.size(); i++) {
-                                        if (ctx._source.latest.lastAnnotator[i] == params.contributor_id) {
-                                            ctx._source.latest.lastAnnotator[i] = 'DELETED_USER';
-                                        }
-                                    }
-                                } else if (ctx._source.latest.lastAnnotator == params.contributor_id) {
-                                    ctx._source.latest.lastAnnotator = 'DELETED_USER';
-                                }
-                            }
-                            
-                            // Mask nested worker data in history array (history is an array of objects)
-                            if (ctx._source.history != null) {
-                                if (ctx._source.history instanceof List) {
-                                    // History is an array - create new array with masked values
-                                    def newHistory = [];
-                                    for (int i = 0; i < ctx._source.history.size(); i++) {
-                                        def historyEntry = ctx._source.history[i];
-                                        def newEntry = [:];
-                                        // Copy all fields from original entry
-                                        for (def key : historyEntry.keySet()) {
-                                            newEntry[key] = historyEntry[key];
-                                        }
-                                        // Mask specific fields
-                                        if (historyEntry.workerId == params.contributor_id) {
-                                            newEntry.workerId = 'DELETED_USER';
-                                        }
-                                        if (historyEntry.workerEmail == params.email) {
-                                            newEntry.workerEmail = 'deleted_user@deleted.com';
-                                        }
-                                        if (historyEntry.lastAnnotatorEmail == params.email) {
-                                            newEntry.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                        }
-                                        if (historyEntry.lastAnnotator == params.contributor_id) {
-                                            newEntry.lastAnnotator = 'DELETED_USER';
-                                        }
-                                        newHistory.add(newEntry);
-                                    }
-                                    ctx._source.history = newHistory;
-                                } else {
-                                    // History is a single object (fallback for backward compatibility)
-                                    if (ctx._source.history.workerId == params.contributor_id) {
-                                        ctx._source.history.workerId = 'DELETED_USER';
-                                    }
-                                    if (ctx._source.history.workerEmail == params.email) {
-                                        ctx._source.history.workerEmail = 'deleted_user@deleted.com';
-                                    }
-                                    if (ctx._source.history.lastAnnotatorEmail instanceof List) {
-                                        for (int i = 0; i < ctx._source.history.lastAnnotatorEmail.size(); i++) {
-                                            if (ctx._source.history.lastAnnotatorEmail[i] == params.email) {
-                                                ctx._source.history.lastAnnotatorEmail[i] = 'deleted_user@deleted.com';
-                                            }
-                                        }
-                                    } else if (ctx._source.history.lastAnnotatorEmail == params.email) {
-                                        ctx._source.history.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                    }
-                                    if (ctx._source.history.lastAnnotator instanceof List) {
-                                        for (int i = 0; i < ctx._source.history.lastAnnotator.size(); i++) {
-                                            if (ctx._source.history.lastAnnotator[i] == params.contributor_id) {
-                                                ctx._source.history.lastAnnotator[i] = 'DELETED_USER';
-                                            }
-                                        }
-                                    } else if (ctx._source.history.lastAnnotator == params.contributor_id) {
-                                        ctx._source.history.lastAnnotator = 'DELETED_USER';
-                                    }
-                                }
-                            }
-                            
-                            // Mask nested worker data in earliest
-                            if (ctx._source.earliest != null) {
-                                if (ctx._source.earliest.workerId == params.contributor_id) {
-                                    ctx._source.earliest.workerId = 'DELETED_USER';
-                                }
-                                if (ctx._source.earliest.workerEmail == params.email) {
-                                    ctx._source.earliest.workerEmail = 'DELETED_USER';
-                                }
-                                if (ctx._source.earliest.lastAnnotatorEmail == params.email) {
-                                    ctx._source.earliest.lastAnnotatorEmail = 'DELETED_USER';
-                                }
-                                if (ctx._source.earliest.lastAnnotator instanceof List) {
-                                    for (int i = 0; i < ctx._source.earliest.lastAnnotator.size(); i++) {
-                                        if (ctx._source.earliest.lastAnnotator[i] == params.contributor_id) {
-                                            ctx._source.earliest.lastAnnotator[i] = 'DELETED_USER';
-                                        }
-                                    }
-                                } else if (ctx._source.earliest.lastAnnotator == params.contributor_id) {
-                                    ctx._source.earliest.lastAnnotator = 'DELETED_USER';
-                                }
-                            }
-                            
-                            // Mask QA checker fields
-                            if (ctx._source.qa_checker_id == params.contributor_id) {
-                                ctx._source.qa_checker_id = 'DELETED_USER';
-                            }
-                            if (ctx._source.qa_checker_email == params.email) {
-                                ctx._source.qa_checker_email = 'DELETED_USER';
-                            }
-                            
-                            // Mask any other email-like fields that might contain the email
-                            for (def field : ctx._source.keySet()) {
-                                if (field.toLowerCase().contains('email') && ctx._source[field] == params.email) {
-                                    ctx._source[field] = 'DELETED_USER';
-                                }
-                                if (field.toLowerCase().contains('worker') && ctx._source[field] == params.contributor_id) {
-                                    ctx._source[field] = 'DELETED_USER';
-                                }
-                            }
-                        """,
-                        "params": {
-                            "contributor_id": contributor_id,
-                            "email": email
-                        }
-                    }
-                }
-                
-                # Create temporary file for query
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                    json.dump({**query, **script}, f)
-                    query_file = f.name
-                
-                logger.info(f"📄 Created temporary query file: {query_file}")
-                logger.info(f"Query payload: {json.dumps({**query, **script}, indent=2)}")
-                
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all contributor masking tasks
+            future_to_contributor = {
+                executor.submit(self._mask_single_contributor_elasticsearch, contributor): contributor 
+                for contributor in contributors
+            }
+            
+            # Process completed tasks
+            contributors_processed = 0
+            for future in as_completed(future_to_contributor):
+                contributor = future_to_contributor[future]
                 try:
-                    # Execute update by query using curl with comprehensive logging
-                    # Use specific project indices instead of all indices
-                    indices_str = ','.join(target_indices)
-                    curl_cmd = [
-                        'curl', '-s', '-X', 'POST',
-                        f'{es_url}/{indices_str}/_update_by_query?wait_for_completion=false&refresh=true',
-                        '-H', 'Content-Type: application/json',
-                        '-d', f'@{query_file}'
-                    ]
-                    
-                    logger.info(f"🚀 Executing Elasticsearch curl command:")
-                    logger.info(f"   Command: {' '.join(curl_cmd)}")
-                    logger.info(f"   Target: Specific project indices ({indices_str})")
-                    logger.info(f"   Operation: Update by query with comprehensive masking")
-                    logger.info(f"   Contributor: {contributor_id}")
-                    logger.info(f"   Email: {email}")
-                    logger.info(f"   Project IDs: {project_ids}")
-                    logger.info(f"   Request URL: {es_url}/{indices_str}/_update_by_query?wait_for_completion=false&refresh=true")
-                    logger.info(f"   Request Headers: Content-Type: application/json")
-                    logger.info(f"   Request Body File: {query_file}")
-                    
-                    # Log the complete request payload
-                    with open(query_file, 'r') as f:
-                        request_payload = f.read()
-                    logger.info(f"📋 Complete Request Payload:")
-                    logger.info(f"   {json.dumps(json.loads(request_payload), indent=2)}")
-                    
-                    start_time = time.time()
-                    result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=300)  # 5 minutes timeout
-                    elapsed_time = time.time() - start_time
-                    
-                    logger.info(f"⏱️  Curl command completed in {elapsed_time:.2f}s with return code: {result.returncode}")
-                    
-                    # Log complete curl response
-                    logger.info(f"📋 Complete Curl Response:")
-                    logger.info(f"   Return Code: {result.returncode}")
-                    logger.info(f"   STDOUT: {result.stdout}")
-                    logger.info(f"   STDERR: {result.stderr}")
-                    
-                    if result.returncode == 0:
-                        try:
-                            response_data = json.loads(result.stdout)
-                            logger.info(f"✅ Elasticsearch operation successful for contributor {contributor_id}")
-                            logger.info(f"📋 Parsed Response Data:")
-                            logger.info(f"   {json.dumps(response_data, indent=2)}")
-                            
-                            # For async operations, we get a task ID instead of updated count
-                            if 'task' in response_data:
-                                task_id = response_data['task']
-                                logger.info(f"🔄 Async task started: {task_id}")
-                                logger.info(f"📊 Task details: {json.dumps(response_data, indent=2)}")
-                                
-                                # Wait for task completion
-                                logger.info(f"⏳ Waiting for task completion: {task_id}")
-                                task_completed = self._wait_for_elasticsearch_task(task_id, contributor_id)
-                                
-                                if task_completed:
-                                    masked_docs += 1  # Count as 1 operation completed
-                                    logger.info(f"✅ Masking operation completed for contributor {contributor_id}")
-                                else:
-                                    logger.warning(f"⚠️  Task may not have completed properly: {task_id}")
-                                    masked_docs += 1  # Still count as attempted
-                            else:
-                                updated_count = response_data.get('updated', 0)
-                                total_hits = response_data.get('total', 0)
-                                masked_docs += updated_count
-                                logger.info(f"📊 Masking results for contributor {contributor_id}:")
-                                logger.info(f"   📄 Total documents found: {total_hits}")
-                                logger.info(f"   ✅ Documents updated: {updated_count}")
-                                logger.info(f"   ⚠️  Documents skipped: {response_data.get('skipped', 0)}")
-                                logger.info(f"   ❌ Documents failed: {response_data.get('failed', 0)}")
-                                logger.info(f"📋 Full Elasticsearch response: {json.dumps(response_data, indent=2)}")
-                                
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"⚠️  Invalid JSON response for contributor {contributor_id}: {e}")
-                            logger.warning(f"📄 Raw STDOUT: {result.stdout}")
-                            logger.warning(f"📄 Raw STDERR: {result.stderr}")
-                    else:
-                        logger.error(f"❌ Elasticsearch update failed for contributor {contributor_id}")
-                        logger.error(f"   Return code: {result.returncode}")
-                        logger.error(f"   Error output: {result.stderr}")
-                        logger.error(f"📄 Full STDOUT: {result.stdout}")
-                        logger.error(f"📄 Full STDERR: {result.stderr}")
-                        
-                finally:
-                    # Clean up temporary file
-                    try:
-                        os.unlink(query_file)
-                        logger.debug(f"🗑️  Cleaned up temporary file: {query_file}")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Could not clean up temporary file {query_file}: {e}")
-                
-                contributors_processed += 1
-                logger.info(f"✅ Completed processing contributor {contributor_id} ({contributors_processed}/{len(contributors)})")
-                logger.info("-" * 60)
+                    result = future.result()
+                    contributors_processed += 1
+                    logger.info(f"✅ Completed Elasticsearch masking for contributor {contributor.contributor_id} ({contributors_processed}/{len(contributors)})")
+                except Exception as e:
+                    logger.error(f"❌ Error masking Elasticsearch data for contributor {contributor.contributor_id}: {e}")
+                    contributors_processed += 1
         
-        except Exception as e:
-            logger.error(f"❌ Error masking Elasticsearch data: {e}")
-            logger.exception("Full exception details:")
+        masked_docs = self.elasticsearch_counter.get_value()
         
         self.stats.elasticsearch_docs_masked = masked_docs
         logger.info("=" * 60)
-        logger.info("🔍 ELASTICSEARCH MASKING SUMMARY")
+        logger.info("🔍 ELASTICSEARCH MASKING SUMMARY (THREADED)")
         logger.info("=" * 60)
         logger.info(f"📊 Contributors processed: {contributors_processed}/{len(contributors)}")
         logger.info(f"📄 Total documents masked: {masked_docs}")
@@ -855,6 +539,324 @@ class CSVContributorDeleter:
             self._verify_elasticsearch_masking(contributors[:1])  # Check first contributor as sample
         
         return masked_docs
+    
+    def _mask_single_contributor_elasticsearch(self, contributor: ContributorInfo) -> int:
+        """Mask Elasticsearch data for a single contributor (thread-safe)"""
+        contributor_id = contributor.contributor_id
+        email = contributor.email_address
+        
+        logger.info(f"🎯 [THREAD] Processing contributor: {contributor_id} (email: {email})")
+        
+        # Get Elasticsearch URL from config file
+        es_url = self.config.get('elasticsearch', 'host', fallback='https://vpc-kepler-es-integration-v1-gsffeklbxeuvx3zx5t3qm3xht4.us-east-1.es.amazonaws.com')
+        if es_url.endswith('/'):
+            es_url = es_url[:-1]
+        
+        try:
+            # Get project IDs for this contributor from PostgreSQL
+            project_ids = self.get_contributor_project_ids(contributor_id)
+            
+            if not project_ids:
+                logger.warning(f"⚠️  [THREAD] No project IDs found for contributor {contributor_id}, trying fallback Elasticsearch masking")
+                # Try fallback method: search across all project indices
+                fallback_masked = self._fallback_elasticsearch_masking(contributor_id, email, es_url)
+                self.elasticsearch_counter.increment(fallback_masked)
+                return fallback_masked
+            
+            # Target project-specific indices (Unit View data is stored here, not in unit-* indices)
+            target_indices = [f"project-{project_id}" for project_id in project_ids]
+            
+            logger.info(f"🎯 [THREAD] Targeting project indices: {target_indices}")
+            
+            # Define comprehensive search query for targeted indices and field variations
+            query = {
+                "query": {
+                    "bool": {
+                        "should": [
+                            # Direct field matches
+                            {"term": {"contributor_id": contributor_id}},
+                            {"term": {"worker_id": contributor_id}},
+                            {"term": {"email": email}},
+                            {"term": {"email_address": email}},
+                            {"term": {"worker_email": email}},
+                            {"term": {"lastAnnotatorEmail": email}},
+                            {"term": {"workerEmail": email}},
+                            
+                            # Keyword field matches (exact)
+                            {"term": {"email.keyword": email}},
+                            {"term": {"email_address.keyword": email}},
+                            {"term": {"worker_email.keyword": email}},
+                            {"term": {"lastAnnotatorEmail.keyword": email}},
+                            {"term": {"workerEmail.keyword": email}},
+                            
+                            # Unit View specific fields
+                            {"term": {"latest.lastAnnotatorEmail": email}},
+                            {"term": {"latest.lastAnnotatorEmail.keyword": email}},
+                            {"term": {"latest.workerEmail": email}},
+                            {"term": {"latest.workerEmail.keyword": email}},
+                            {"term": {"latest.lastReviewerEmail": email}},
+                            {"term": {"latest.lastReviewerEmail.keyword": email}},
+                            {"term": {"latest.lastAnnotator": contributor_id}},
+                            {"term": {"latest.workerId": contributor_id}},
+                            
+                            # History array matches
+                            {"term": {"history.workerId": contributor_id}},
+                            {"term": {"history.workerEmail": email}},
+                            {"term": {"history.workerEmail.keyword": email}},
+                            {"term": {"history.lastAnnotatorEmail": email}},
+                            {"term": {"history.lastAnnotatorEmail.keyword": email}},
+                            {"term": {"history.lastAnnotator": contributor_id}},
+                            
+                            # Earliest field matches
+                            {"term": {"earliest.workerId": contributor_id}},
+                            {"term": {"earliest.workerEmail": email}},
+                            {"term": {"earliest.workerEmail.keyword": email}},
+                            {"term": {"earliest.lastAnnotatorEmail": email}},
+                            {"term": {"earliest.lastAnnotatorEmail.keyword": email}},
+                            {"term": {"earliest.lastAnnotator": contributor_id}},
+                            
+                            # QA checker fields
+                            {"term": {"qa_checker_id": contributor_id}},
+                            {"term": {"qa_checker_email": email}},
+                            {"term": {"qa_checker_email.keyword": email}},
+                            
+                            # Wildcard searches for partial matches
+                            {"query_string": {"query": f"*{email}*"}},
+                            {"query_string": {"query": f"*{contributor_id}*"}}
+                        ],
+                        "minimum_should_match": 1
+                    }
+                }
+            }
+            
+            # Define comprehensive update script covering all field variations
+            script = {
+                "script": {
+                    "source": """
+                        // Log the operation
+                        ctx._source._masking_log = 'Masked by contributor deletion script at ' + new Date().toString();
+                        
+                        // Direct field masking
+                        if (ctx._source.contributor_id == params.contributor_id) {
+                            ctx._source.contributor_id = 'DELETED_USER';
+                        }
+                        if (ctx._source.worker_id == params.contributor_id) {
+                            ctx._source.worker_id = 'DELETED_USER';
+                        }
+                        if (ctx._source.email == params.email) {
+                            ctx._source.email = 'DELETED_USER';
+                        }
+                        if (ctx._source.email_address == params.email) {
+                            ctx._source.email_address = 'DELETED_USER';
+                        }
+                        if (ctx._source.worker_email == params.email) {
+                            ctx._source.worker_email = 'DELETED_USER';
+                        }
+                        if (ctx._source.lastAnnotatorEmail == params.email) {
+                            ctx._source.lastAnnotatorEmail = 'DELETED_USER';
+                        }
+                        if (ctx._source.workerEmail == params.email) {
+                            ctx._source.workerEmail = 'DELETED_USER';
+                        }
+                        if (ctx._source.name != null && ctx._source.name != 'DELETED_USER') {
+                            ctx._source.name = 'DELETED_USER';
+                        }
+                        
+                        // Mask nested worker data in latest (Unit View specific fields)
+                        if (ctx._source.latest != null) {
+                            if (ctx._source.latest.workerId == params.contributor_id) {
+                                ctx._source.latest.workerId = 'DELETED_USER';
+                            }
+                            if (ctx._source.latest.workerEmail == params.email) {
+                                ctx._source.latest.workerEmail = 'DELETED_USER';
+                            }
+                            if (ctx._source.latest.lastAnnotatorEmail == params.email) {
+                                ctx._source.latest.lastAnnotatorEmail = 'DELETED_USER';
+                            }
+                            if (ctx._source.latest.lastReviewerEmail == params.email) {
+                                ctx._source.latest.lastReviewerEmail = 'DELETED_USER';
+                            }
+                            if (ctx._source.latest.lastAnnotator instanceof List) {
+                                for (int i = 0; i < ctx._source.latest.lastAnnotator.size(); i++) {
+                                    if (ctx._source.latest.lastAnnotator[i] == params.contributor_id) {
+                                        ctx._source.latest.lastAnnotator[i] = 'DELETED_USER';
+                                    }
+                                }
+                            } else if (ctx._source.latest.lastAnnotator == params.contributor_id) {
+                                ctx._source.latest.lastAnnotator = 'DELETED_USER';
+                            }
+                        }
+                        
+                        // Mask nested worker data in history array (history is an array of objects)
+                        if (ctx._source.history != null) {
+                            if (ctx._source.history instanceof List) {
+                                // History is an array - create new array with masked values
+                                def newHistory = [];
+                                for (int i = 0; i < ctx._source.history.size(); i++) {
+                                    def historyEntry = ctx._source.history[i];
+                                    def newEntry = [:];
+                                    // Copy all fields from original entry
+                                    for (def key : historyEntry.keySet()) {
+                                        newEntry[key] = historyEntry[key];
+                                    }
+                                    // Mask specific fields
+                                    if (historyEntry.workerId == params.contributor_id) {
+                                        newEntry.workerId = 'DELETED_USER';
+                                    }
+                                    if (historyEntry.workerEmail == params.email) {
+                                        newEntry.workerEmail = 'deleted_user@deleted.com';
+                                    }
+                                    if (historyEntry.lastAnnotatorEmail == params.email) {
+                                        newEntry.lastAnnotatorEmail = 'deleted_user@deleted.com';
+                                    }
+                                    if (historyEntry.lastAnnotator == params.contributor_id) {
+                                        newEntry.lastAnnotator = 'DELETED_USER';
+                                    }
+                                    newHistory.add(newEntry);
+                                }
+                                ctx._source.history = newHistory;
+                            } else {
+                                // History is a single object (fallback for backward compatibility)
+                                if (ctx._source.history.workerId == params.contributor_id) {
+                                    ctx._source.history.workerId = 'DELETED_USER';
+                                }
+                                if (ctx._source.history.workerEmail == params.email) {
+                                    ctx._source.history.workerEmail = 'deleted_user@deleted.com';
+                                }
+                                if (ctx._source.history.lastAnnotatorEmail instanceof List) {
+                                    for (int i = 0; i < ctx._source.history.lastAnnotatorEmail.size(); i++) {
+                                        if (ctx._source.history.lastAnnotatorEmail[i] == params.email) {
+                                            ctx._source.history.lastAnnotatorEmail[i] = 'deleted_user@deleted.com';
+                                        }
+                                    }
+                                } else if (ctx._source.history.lastAnnotatorEmail == params.email) {
+                                    ctx._source.history.lastAnnotatorEmail = 'deleted_user@deleted.com';
+                                }
+                                if (ctx._source.history.lastAnnotator instanceof List) {
+                                    for (int i = 0; i < ctx._source.history.lastAnnotator.size(); i++) {
+                                        if (ctx._source.history.lastAnnotator[i] == params.contributor_id) {
+                                            ctx._source.history.lastAnnotator[i] = 'DELETED_USER';
+                                        }
+                                    }
+                                } else if (ctx._source.history.lastAnnotator == params.contributor_id) {
+                                    ctx._source.history.lastAnnotator = 'DELETED_USER';
+                                }
+                            }
+                        }
+                        
+                        // Mask nested worker data in earliest
+                        if (ctx._source.earliest != null) {
+                            if (ctx._source.earliest.workerId == params.contributor_id) {
+                                ctx._source.earliest.workerId = 'DELETED_USER';
+                            }
+                            if (ctx._source.earliest.workerEmail == params.email) {
+                                ctx._source.earliest.workerEmail = 'DELETED_USER';
+                            }
+                            if (ctx._source.earliest.lastAnnotatorEmail == params.email) {
+                                ctx._source.earliest.lastAnnotatorEmail = 'DELETED_USER';
+                            }
+                            if (ctx._source.earliest.lastAnnotator instanceof List) {
+                                for (int i = 0; i < ctx._source.earliest.lastAnnotator.size(); i++) {
+                                    if (ctx._source.earliest.lastAnnotator[i] == params.contributor_id) {
+                                        ctx._source.earliest.lastAnnotator[i] = 'DELETED_USER';
+                                    }
+                                }
+                            } else if (ctx._source.earliest.lastAnnotator == params.contributor_id) {
+                                ctx._source.earliest.lastAnnotator = 'DELETED_USER';
+                            }
+                        }
+                        
+                        // Mask QA checker fields
+                        if (ctx._source.qa_checker_id == params.contributor_id) {
+                            ctx._source.qa_checker_id = 'DELETED_USER';
+                        }
+                        if (ctx._source.qa_checker_email == params.email) {
+                            ctx._source.qa_checker_email = 'DELETED_USER';
+                        }
+                        
+                        // Mask any other email-like fields that might contain the email
+                        for (def field : ctx._source.keySet()) {
+                            if (field.toLowerCase().contains('email') && ctx._source[field] == params.email) {
+                                ctx._source[field] = 'DELETED_USER';
+                            }
+                            if (field.toLowerCase().contains('worker') && ctx._source[field] == params.contributor_id) {
+                                ctx._source[field] = 'DELETED_USER';
+                            }
+                        }
+                    """,
+                    "params": {
+                        "contributor_id": contributor_id,
+                        "email": email
+                    }
+                }
+            }
+            
+            # Create temporary file for query
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump({**query, **script}, f)
+                query_file = f.name
+            
+            try:
+                # Execute update by query using curl
+                indices_str = ','.join(target_indices)
+                curl_cmd = [
+                    'curl', '-s', '-X', 'POST',
+                    f'{es_url}/{indices_str}/_update_by_query?wait_for_completion=false&refresh=true',
+                    '-H', 'Content-Type: application/json',
+                    '-d', f'@{query_file}'
+                ]
+                
+                logger.info(f"🚀 [THREAD] Executing Elasticsearch curl command for contributor {contributor_id}")
+                
+                start_time = time.time()
+                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=300)  # 5 minutes timeout
+                elapsed_time = time.time() - start_time
+                
+                logger.info(f"⏱️  [THREAD] Curl command completed in {elapsed_time:.2f}s with return code: {result.returncode}")
+                
+                if result.returncode == 0:
+                    try:
+                        response_data = json.loads(result.stdout)
+                        logger.info(f"✅ [THREAD] Elasticsearch operation successful for contributor {contributor_id}")
+                        
+                        # For async operations, we get a task ID instead of updated count
+                        if 'task' in response_data:
+                            task_id = response_data['task']
+                            logger.info(f"🔄 [THREAD] Async task started: {task_id}")
+                            
+                            # Wait for task completion
+                            task_completed = self._wait_for_elasticsearch_task(task_id, contributor_id)
+                            
+                            if task_completed:
+                                self.elasticsearch_counter.increment(1)  # Count as 1 operation completed
+                                logger.info(f"✅ [THREAD] Masking operation completed for contributor {contributor_id}")
+                            else:
+                                logger.warning(f"⚠️  [THREAD] Task may not have completed properly: {task_id}")
+                                self.elasticsearch_counter.increment(1)  # Still count as attempted
+                        else:
+                            updated_count = response_data.get('updated', 0)
+                            self.elasticsearch_counter.increment(updated_count)
+                            logger.info(f"📊 [THREAD] Masking results for contributor {contributor_id}: {updated_count} documents updated")
+                            
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"⚠️  [THREAD] Invalid JSON response for contributor {contributor_id}: {e}")
+                else:
+                    logger.error(f"❌ [THREAD] Elasticsearch update failed for contributor {contributor_id}")
+                    logger.error(f"   Return code: {result.returncode}")
+                    logger.error(f"   Error output: {result.stderr}")
+                    
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(query_file)
+                except Exception as e:
+                    logger.warning(f"⚠️  [THREAD] Could not clean up temporary file {query_file}: {e}")
+            
+            return self.elasticsearch_counter.get_value()
+            
+        except Exception as e:
+            logger.error(f"❌ [THREAD] Error masking Elasticsearch data for contributor {contributor_id}: {e}")
+            return 0
     
     def _fallback_elasticsearch_masking(self, contributor_id: str, email: str, es_url: str) -> int:
         """Fallback Elasticsearch masking when no project IDs are found - searches across all project indices"""
@@ -1605,8 +1607,10 @@ class CSVContributorDeleter:
         deleted_records = 0
         
         try:
-            conn = self.get_postgres_connection()
+            # Get a fresh PostgreSQL connection for this operation
+            conn = self.get_postgres_connection(force_fresh=True)
             cursor = conn.cursor()
+            logger.info("✅ Fresh PostgreSQL connection established for deactivation")
         except Exception as e:
             logger.warning(f"PostgreSQL connection failed (this may be expected for integration environment): {e}")
             logger.info("Skipping PostgreSQL data deletion and continuing with other operations...")
@@ -1629,7 +1633,7 @@ class CSVContributorDeleter:
                 logger.info("Skipping PostgreSQL deletion as no contributors exist")
                 return 0
             
-            # Delete from tables using contributor_id
+            # Deactivate records in tables using contributor_id
             logger.info(f"Processing {len(self.contributor_id_tables)} contributor_id tables...")
             logger.debug(f"Tables to process: {self.contributor_id_tables}")
             
@@ -1639,19 +1643,19 @@ class CSVContributorDeleter:
                     logger.debug(f"Processing table: {table}")
                     
                     if table == 'kepler_crowd_contributors_t':
-                        # For main table, also mask PII data instead of deleting
-                        logger.debug(f"Masking PII data in main table: {table}")
-                        self._mask_pii_data(cursor, table, contributor_ids_str)
+                        # For main table, deactivate and mask PII data
+                        logger.debug(f"Deactivating and masking PII data in main table: {table}")
+                        self._deactivate_and_mask_pii_data(cursor, table, contributor_ids_str)
                     else:
-                        logger.debug(f"Deleting records from table: {table}")
-                        query = f"DELETE FROM {table} WHERE contributor_id IN ('{contributor_ids_str}')"
+                        logger.debug(f"Deactivating records in table: {table}")
+                        query = f"UPDATE {table} SET status = 'INACTIVE' WHERE contributor_id IN ('{contributor_ids_str}')"
                         logger.debug(f"Executing query: {query}")
                         cursor.execute(query)
                         deleted_records += cursor.rowcount
                         if cursor.rowcount > 0:
-                            logger.info(f"Deleted {cursor.rowcount} records from {table}")
+                            logger.info(f"Deactivated {cursor.rowcount} records in {table}")
                         else:
-                            logger.debug(f"No records found to delete in {table}")
+                            logger.debug(f"No records found to deactivate in {table}")
                     
                     logger.debug(f"Successfully processed table: {table}")
                 
@@ -1794,6 +1798,61 @@ class CSVContributorDeleter:
         
         except Exception as e:
             logger.error(f"❌ Error masking PII data in {table}: {e}")
+            logger.error(f"   Failed query: {query}")
+            logger.exception("Full exception details:")
+            raise
+
+    def _deactivate_and_mask_pii_data(self, cursor, table: str, contributor_ids_str: str):
+        """Deactivate and mask PII data instead of deleting from main contributor table"""
+        try:
+            logger.info(f"🚫 DEACTIVATING AND MASKING PII DATA in table: {table}")
+            logger.debug(f"Executing deactivation and PII masking query for table: {table}")
+            
+            # Update contributor data to deactivate and mask PII
+            if table == 'kepler_crowd_contributors_t':
+                where_clause = f"WHERE id IN ('{contributor_ids_str}')"
+                logger.info(f"🔑 Using 'id' column for main contributors table: {table}")
+            else:
+                where_clause = f"WHERE contributor_id IN ('{contributor_ids_str}')"
+                logger.info(f"🔑 Using 'contributor_id' column for mapping table: {table}")
+            
+            # Create unique email for each contributor to avoid conflicts
+            unique_email = f"deleted_user_{table}_{contributor_ids_str.replace(',', '_').replace(chr(39), '')}@deleted.com"
+            
+            query = f"""
+                UPDATE {table} 
+                SET 
+                    status = 'INACTIVE',
+                    name = 'DELETED_USER',
+                    email_address = '{unique_email}',
+                    country = 'DELETED',
+                    age = 'DELETED',
+                    gender = 'DELETED',
+                    mobile_os = 'DELETED',
+                    ethnicity = 'DELETED',
+                    language = 'DELETED',
+                    updated_at = NOW(),
+                    updated_by = 'contributor_deletion_script'
+                {where_clause}
+            """
+            
+            logger.debug(f"Executing deactivation and PII masking query: {query}")
+            
+            start_time = time.time()
+            cursor.execute(query)
+            elapsed_time = time.time() - start_time
+            
+            deactivated_records = cursor.rowcount
+            self.stats.pii_masked_records += deactivated_records
+            
+            logger.info(f"✅ PostgreSQL deactivation and PII masking completed:")
+            logger.info(f"   📊 Records deactivated and masked: {deactivated_records}")
+            logger.info(f"   ⏱️  Execution time: {elapsed_time:.2f}s")
+            logger.info(f"   🎯 Table: {table}")
+            logger.debug(f"Deactivation and PII masking completed for table {table} with {deactivated_records} records affected")
+        
+        except Exception as e:
+            logger.error(f"❌ Error deactivating and masking PII data in {table}: {e}")
             logger.error(f"   Failed query: {query}")
             logger.exception("Full exception details:")
             raise

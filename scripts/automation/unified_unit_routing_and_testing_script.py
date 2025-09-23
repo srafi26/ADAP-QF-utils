@@ -374,7 +374,7 @@ class UnifiedUnitRoutingAndTesting:
         }
         
         # Use specific API key for send-to-job endpoint
-        api_key = "xhexDL_8eCz4WYw-3MKc"
+        api_key = self.config.get('api', 'send_to_job_api_key')
         headers = {
             'Authorization': f'Token token={api_key}',
             'Content-Type': 'application/json'
@@ -474,6 +474,20 @@ class UnifiedUnitRoutingAndTesting:
             response = requests.get(fetch_url, headers=headers, timeout=10)
             elapsed = time.time() - start_time
             
+            # 📊 COMPREHENSIVE API RESPONSE LOGGING
+            logger.info("=" * 80)
+            logger.info("📊 FULL API RESPONSE DETAILS")
+            logger.info("=" * 80)
+            logger.info(f"🔗 Request URL: {fetch_url}")
+            logger.info(f"📤 Request Headers: {dict(headers)}")
+            logger.info(f"⏱️  Response Time: {elapsed:.3f}s")
+            logger.info(f"📊 Status Code: {response.status_code}")
+            logger.info(f"📋 Response Headers: {dict(response.headers)}")
+            logger.info(f"📄 Response Text (first 500 chars): {response.text[:500]}")
+            if len(response.text) > 500:
+                logger.info(f"📄 Response Text (remaining): ... ({len(response.text) - 500} more chars)")
+            logger.info("=" * 80)
+            
             if response.status_code == 200:
                 try:
                     data = response.json()
@@ -519,6 +533,15 @@ class UnifiedUnitRoutingAndTesting:
                     'error': None
                 }
             else:
+                # 📊 NON-200 STATUS CODE LOGGING
+                logger.error("=" * 80)
+                logger.error("❌ NON-200 STATUS CODE RESPONSE")
+                logger.error("=" * 80)
+                logger.error(f"📊 Status Code: {response.status_code}")
+                logger.error(f"📋 Response Headers: {dict(response.headers)}")
+                logger.error(f"📄 Full Response Text: {response.text}")
+                logger.error("=" * 80)
+                
                 error_msg = f"HTTP {response.status_code}: {response.text}"
                 logger.error(f"❌ Fetch failed: {error_msg}")
                 return {
