@@ -113,7 +113,8 @@ class UnifiedUnitRoutingAndTesting:
                  judgment_option: str = "first_option",
                  base_url: str = None,
                  db_config: Optional[Dict] = None,
-                 api_config: Optional[Dict] = None):
+                 api_config: Optional[Dict] = None,
+                 config: Optional[configparser.ConfigParser] = None):
         
         self.project_id = project_id
         self.job_id = job_id
@@ -122,6 +123,9 @@ class UnifiedUnitRoutingAndTesting:
         self.secret = secret or os.getenv('JOB_SECRET', 'VCGGPn3gBcFnFYEPFI4uhaMCxGj7C2PNhGpFxxRbvup6sK')
         self.judgment_option = judgment_option
         self.base_url = (base_url or os.getenv('API_BASE_URL', 'https://api-beta.integration.cf3.us')).rstrip('/')
+        
+        # Configuration parser
+        self.config = config or self._get_default_config()
         
         # Database configuration (dynamic based on environment)
         self.db_config = db_config or self._get_default_db_config()
@@ -168,6 +172,16 @@ class UnifiedUnitRoutingAndTesting:
         
         # Initialize database connection
         self.db_connection = None
+    
+    def _get_default_config(self) -> configparser.ConfigParser:
+        """Get default configuration parser with fallback values"""
+        config = configparser.ConfigParser()
+        
+        # Add default API section
+        config.add_section('api')
+        config.set('api', 'send_to_job_api_key', os.getenv('API_TOKEN', 'CgjVt3SvJfoQn_buVuaM'))
+        
+        return config
     
     def _get_default_db_config(self) -> Dict:
         """Get default database configuration from environment variables or sensible defaults"""
@@ -921,14 +935,10 @@ def main():
                 return 1
         
         # Load configuration file (default to integration for safety)
-        config = {}
+        config_parser = configparser.ConfigParser()
         config_file_path = os.path.expanduser(args.config_file)
         if os.path.exists(config_file_path):
-            import configparser
-            config_parser = configparser.ConfigParser()
             config_parser.read(config_file_path)
-            for section in config_parser.sections():
-                config[section] = dict(config_parser[section])
             logger.info(f"📁 Loaded configuration from: {config_file_path}")
         else:
             logger.warning(f"⚠️ Configuration file not found: {config_file_path}, using defaults")
@@ -972,7 +982,8 @@ def main():
             judgment_option=args.option,
             base_url=args.base_url,
             db_config=db_config,
-            api_config=api_config
+            api_config=api_config,
+            config=config_parser
         )
         
         # Load contributors if needed

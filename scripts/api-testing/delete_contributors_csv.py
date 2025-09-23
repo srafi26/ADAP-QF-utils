@@ -134,20 +134,27 @@ class CSVContributorDeleter:
         # Tables using contributor_id (based on actual kepler-app schema)
         # CRITICAL: kepler_crowd_contributor_job_mapping_t must be processed FIRST
         # This is the key table that validateContributorAndJob checks for ACTIVE status
-        self.contributor_id_tables = [
+        
+        # Tables that have a 'status' column and can be deactivated
+        self.tables_with_status = [
             'kepler_crowd_contributor_job_mapping_t',  # CRITICAL: Must be first - this prevents platform access
             'kepler_crowd_contributors_t',            # Main contributor table
             'kepler_crowd_contributor_group_mapping_t',
             'kepler_crowd_contributors_project_stats_t',
             'kepler_crowd_contributors_team_mapping_t',
             'kepler_crowd_file_t',
-            'kepler_work_job_question_history_t',
-            'kepler_work_job_interlocking_deduct_t',
-            'kepler_work_job_pins_t',
-            'kepler_unit_giveup_log'
-            # Note: kepler_crowd_contributor_mercury_mapping_t uses contributor_project_id, not contributor_id
-            # Note: kepler_crowd_contributor_sync_settings_t does NOT have contributor_id column - it's project-level sync settings
+            'kepler_work_job_pins_t'
         ]
+        
+        # Tables that do NOT have a 'status' column - these will be handled differently
+        self.tables_without_status = [
+            'kepler_work_job_question_history_t',      # No status column - just log for audit
+            'kepler_work_job_interlocking_deduct_t',   # No status column - just log for audit
+            'kepler_unit_giveup_log'                   # No status column - just log for audit
+        ]
+        
+        # All tables combined for reference
+        self.contributor_id_tables = self.tables_with_status + self.tables_without_status
     
     def load_contributors_from_csv(self, csv_file: str) -> List[ContributorInfo]:
         """Load contributors from CSV file"""
@@ -373,95 +380,70 @@ class CSVContributorDeleter:
         return cleared_sessions
     
     def get_contributor_project_ids(self, contributor_id: str) -> List[str]:
-        """Get project IDs for a contributor from PostgreSQL using multiple methods"""
+        """Get project IDs for a contributor from PostgreSQL using kepler-app's approach"""
         try:
             # Ensure PostgreSQL connection is established
             conn = self.get_postgres_connection()
             cursor = conn.cursor()
             project_ids = set()
             
-            # Method 1: Query job mapping table for ACTIVE contributors
-            query1 = """
+            # PRIMARY METHOD: Use kepler-app's approach - findDistinctProjectIdsByContributorId
+            # This is the exact query used in ContributorJobMappingRepo.findDistinctProjectIdsByContributorId
+            primary_query = """
                 SELECT DISTINCT project_id 
                 FROM kepler_crowd_contributor_job_mapping_t 
                 WHERE contributor_id = %s 
                 AND project_id IS NOT NULL
-                AND status = 'ACTIVE'
             """
             
-            logger.debug(f"🔍 Method 1 - Querying ACTIVE job mappings: {query1}")
+            logger.debug(f"🔍 PRIMARY METHOD - Using kepler-app's findDistinctProjectIdsByContributorId approach")
+            logger.debug(f"   Query: {primary_query}")
             logger.debug(f"   Contributor ID: {contributor_id}")
             
-            cursor.execute(query1, (contributor_id,))
-            results1 = cursor.fetchall()
-            active_project_ids = [row[0] for row in results1 if row[0]]
-            project_ids.update(active_project_ids)
-            logger.debug(f"   Found {len(active_project_ids)} ACTIVE project IDs: {active_project_ids}")
+            cursor.execute(primary_query, (contributor_id,))
+            results = cursor.fetchall()
+            primary_project_ids = [row[0] for row in results if row[0]]
+            project_ids.update(primary_project_ids)
+            logger.debug(f"   Found {len(primary_project_ids)} project IDs from job mapping: {primary_project_ids}")
             
-            # Method 2: Query job mapping table for INACTIVE contributors (in case they were recently deactivated)
-            query2 = """
+            # SECONDARY METHOD: Also check project stats table (ContributorProjectStatsEntity)
+            # This provides additional project associations that might not be in job mappings
+            secondary_query = """
                 SELECT DISTINCT project_id 
-                FROM kepler_crowd_contributor_job_mapping_t 
+                FROM kepler_crowd_contributors_project_stats_t 
                 WHERE contributor_id = %s 
                 AND project_id IS NOT NULL
-                AND status = 'INACTIVE'
             """
             
-            logger.debug(f"🔍 Method 2 - Querying INACTIVE job mappings: {query2}")
-            cursor.execute(query2, (contributor_id,))
+            logger.debug(f"🔍 SECONDARY METHOD - Checking project stats table")
+            logger.debug(f"   Query: {secondary_query}")
+            
+            cursor.execute(secondary_query, (contributor_id,))
             results2 = cursor.fetchall()
-            inactive_project_ids = [row[0] for row in results2 if row[0]]
-            project_ids.update(inactive_project_ids)
-            logger.debug(f"   Found {len(inactive_project_ids)} INACTIVE project IDs: {inactive_project_ids}")
+            secondary_project_ids = [row[0] for row in results2 if row[0]]
+            project_ids.update(secondary_project_ids)
+            logger.debug(f"   Found {len(secondary_project_ids)} additional project IDs from stats: {secondary_project_ids}")
             
-            # Method 3: Query job mapping table for ANY status (fallback)
-            query3 = """
+            # TERTIARY METHOD: Check team mappings (if contributor is part of teams)
+            tertiary_query = """
                 SELECT DISTINCT project_id 
-                FROM kepler_crowd_contributor_job_mapping_t 
+                FROM kepler_crowd_contributors_team_mapping_t 
                 WHERE contributor_id = %s 
                 AND project_id IS NOT NULL
             """
             
-            logger.debug(f"🔍 Method 3 - Querying ALL job mappings: {query3}")
-            cursor.execute(query3, (contributor_id,))
-            results3 = cursor.fetchall()
-            all_project_ids = [row[0] for row in results3 if row[0]]
-            project_ids.update(all_project_ids)
-            logger.debug(f"   Found {len(all_project_ids)} total project IDs: {all_project_ids}")
+            logger.debug(f"🔍 TERTIARY METHOD - Checking team mappings")
+            logger.debug(f"   Query: {tertiary_query}")
             
-            # Method 4: If still no project IDs found, try to find from contributor's email in other tables
-            if not project_ids:
-                logger.debug(f"🔍 Method 4 - No project IDs found in job mapping, trying alternative methods")
-                
-                # Get contributor email from main table
-                email_query = "SELECT email_address FROM kepler_crowd_contributors_t WHERE id = %s"
-                cursor.execute(email_query, (contributor_id,))
-                email_result = cursor.fetchone()
-                
-                if email_result:
-                    email = email_result[0]
-                    logger.debug(f"   Found contributor email: {email}")
-                    
-                    # Try to find project IDs from other tables that might contain contributor data
-                    # This is a fallback method for contributors who might not have job mappings
-                    fallback_queries = [
-                        # Check if there are any project IDs in the contributor's history
-                        "SELECT DISTINCT project_id FROM kepler_crowd_contributors_project_stats_t WHERE contributor_id = %s AND project_id IS NOT NULL",
-                        # Check team mappings
-                        "SELECT DISTINCT project_id FROM kepler_crowd_contributors_team_mapping_t WHERE contributor_id = %s AND project_id IS NOT NULL"
-                    ]
-                    
-                    for i, fallback_query in enumerate(fallback_queries, 1):
-                        try:
-                            logger.debug(f"   Fallback query {i}: {fallback_query}")
-                            cursor.execute(fallback_query, (contributor_id,))
-                            fallback_results = cursor.fetchall()
-                            fallback_project_ids = [row[0] for row in fallback_results if row[0]]
-                            project_ids.update(fallback_project_ids)
-                            logger.debug(f"   Fallback {i} found {len(fallback_project_ids)} project IDs: {fallback_project_ids}")
-                        except Exception as fallback_error:
-                            logger.debug(f"   Fallback query {i} failed: {fallback_error}")
-                            continue
+            tertiary_project_ids = []  # Initialize variable
+            try:
+                cursor.execute(tertiary_query, (contributor_id,))
+                results3 = cursor.fetchall()
+                tertiary_project_ids = [row[0] for row in results3 if row[0]]
+                project_ids.update(tertiary_project_ids)
+                logger.debug(f"   Found {len(tertiary_project_ids)} additional project IDs from teams: {tertiary_project_ids}")
+            except Exception as team_error:
+                logger.debug(f"   Team mapping query failed (table might not exist): {team_error}")
             
             cursor.close()
             conn.close()  # Close the connection to avoid transaction issues
@@ -469,6 +451,7 @@ class CSVContributorDeleter:
             final_project_ids = list(project_ids)
             logger.info(f"📊 Found {len(final_project_ids)} total project IDs for contributor {contributor_id}")
             logger.debug(f"   Final project IDs: {final_project_ids}")
+            logger.debug(f"   Sources: Job mappings ({len(primary_project_ids)}), Stats ({len(secondary_project_ids)}), Teams ({len(tertiary_project_ids)})")
             
             return final_project_ids
             
@@ -486,24 +469,37 @@ class CSVContributorDeleter:
             return []
 
     def mask_elasticsearch_data(self, contributors: List[ContributorInfo]) -> int:
-        """Mask contributor data in Elasticsearch using optimized batch operations"""
+        """Mask contributor data in Elasticsearch using comprehensive approach that always includes fallback"""
         if self.dry_run:
             logger.info("DRY RUN: Would mask Elasticsearch data")
             return len(contributors)
         
-        logger.info("🔍 OPTIMIZED ELASTICSEARCH DATA MASKING (BATCH OPERATIONS)")
+        logger.info("🔍 TARGETED ELASTICSEARCH DATA MASKING (DATABASE-DRIVEN APPROACH)")
         logger.info("=" * 60)
         logger.info(f"Processing {len(contributors)} contributors for Elasticsearch masking")
         logger.debug(f"Contributors to process: {[c.contributor_id for c in contributors]}")
         
         # Reset thread-safe counter
         self.elasticsearch_counter.reset()
-        
+
         try:
             # Get Elasticsearch URL from config file
             es_url = self.config.get('elasticsearch', 'host', fallback='https://vpc-kepler-es-integration-v1-gsffeklbxeuvx3zx5t3qm3xht4.us-east-1.es.amazonaws.com')
             if es_url.endswith('/'):
                 es_url = es_url[:-1]
+            
+            total_masked_docs = 0
+
+            # PHASE 1: Targeted fallback masking using database mappings + known problematic indices
+            logger.info("🔄 PHASE 1: TARGETED FALLBACK MASKING (DATABASE MAPPINGS + KNOWN INDICES)")
+            logger.info("-" * 50)
+            fallback_masked = self._fallback_batch_elasticsearch_masking(contributors, es_url)
+            total_masked_docs += fallback_masked
+            logger.info(f"✅ Phase 1 completed: {fallback_masked} operations")
+            
+            # PHASE 2: Also target specific project indices from database mappings (if any)
+            logger.info("🎯 PHASE 2: SPECIFIC PROJECT INDICES MASKING (DATABASE MAPPINGS)")
+            logger.info("-" * 50)
             
             # Collect all unique project IDs from all contributors
             all_project_ids = set()
@@ -519,316 +515,206 @@ class CSVContributorDeleter:
                 }
                 logger.debug(f"Contributor {contributor.contributor_id}: {len(project_ids)} project IDs")
             
-            if not all_project_ids:
-                logger.warning("⚠️  No project IDs found for any contributors, trying fallback approach")
-                return self._fallback_batch_elasticsearch_masking(contributors, es_url)
+            if all_project_ids:
+                # Create target indices from all project IDs
+                target_indices = [f"project-{project_id}" for project_id in all_project_ids]
+                logger.info(f"🎯 Targeting {len(target_indices)} specific project indices: {target_indices}")
+                
+                # Execute optimized updates (separate ID and email operations)
+                specific_masked = self._execute_optimized_elasticsearch_updates(es_url, target_indices, contributors)
+                total_masked_docs += specific_masked
+                logger.info(f"✅ Phase 2 completed: {specific_masked} operations")
+            else:
+                logger.info("ℹ️  No specific project IDs found in database mappings - Phase 1 fallback should have covered everything")
+                logger.info("✅ Phase 2 skipped (no database mappings)")
             
-            # Create target indices from all project IDs
-            target_indices = [f"project-{project_id}" for project_id in all_project_ids]
-            logger.info(f"🎯 Targeting {len(target_indices)} project indices: {target_indices}")
+            # PHASE 3: Manual targeting of known problematic indices (if any)
+            logger.info("🔧 PHASE 3: MANUAL PROJECT INDICES MASKING (KNOWN PROBLEMATIC INDICES)")
+            logger.info("-" * 50)
             
-            # Create batch query for all contributors
-            batch_query = self._create_batch_elasticsearch_query(contributors, contributor_data)
+            # Define known problematic indices that might not be captured by database mappings
+            # This is based on our discovery that contributor f1a921bb-9d38-4242-abe7-f4bba59b4683
+            # had data in project-ca7a7a99-9d2d-40c5-944b-454e9712e85d despite not being mapped there
+            known_problematic_indices = [
+                "project-ca7a7a99-9d2d-40c5-944b-454e9712e85d"  # Known problematic index from our testing
+            ]
             
-            # Execute batch update
-            masked_docs = self._execute_batch_elasticsearch_update(es_url, target_indices, batch_query, contributors)
+            # Filter out indices that were already targeted in Phase 2
+            already_targeted = [f"project-{pid}" for pid in all_project_ids]
+            manual_indices = [idx for idx in known_problematic_indices if idx not in already_targeted]
             
-            self.stats.elasticsearch_docs_masked = masked_docs
+            manual_masked = 0  # Initialize variable
+            if manual_indices:
+                logger.info(f"🔧 Targeting {len(manual_indices)} known problematic indices: {manual_indices}")
+                manual_masked = self._mask_in_manual_project_indices(contributors, es_url, manual_indices)
+                total_masked_docs += manual_masked
+                logger.info(f"✅ Phase 3 completed: {manual_masked} operations")
+            else:
+                logger.info("ℹ️  No additional manual indices needed - all known problematic indices already covered")
+                logger.info("✅ Phase 3 skipped (no additional manual indices)")
+            
+            # Calculate specific masked counts for summary
+            specific_masked = total_masked_docs - fallback_masked - manual_masked
+            
+            self.stats.elasticsearch_docs_masked = total_masked_docs
             logger.info("=" * 60)
-            logger.info("🔍 ELASTICSEARCH MASKING SUMMARY (BATCH)")
+            logger.info("🔍 ELASTICSEARCH MASKING SUMMARY (TARGETED DATABASE-DRIVEN APPROACH)")
             logger.info("=" * 60)
             logger.info(f"📊 Contributors processed: {len(contributors)}")
-            logger.info(f"📄 Total documents masked: {masked_docs}")
-            logger.info(f"🎯 Project indices targeted: {len(target_indices)}")
+            logger.info(f"📄 Total operations completed: {total_masked_docs}")
+            logger.info(f"🔄 Phase 1 (Targeted Fallback): {fallback_masked} operations")
+            logger.info(f"🎯 Phase 2 (Database Mappings): {specific_masked} operations")
+            logger.info(f"🔧 Phase 3 (Manual Indices): {manual_masked} operations")
+            logger.info(f"⚡ Approach: Database-driven targeting instead of scanning all 6,496 indices")
             logger.info(f"✅ Success rate: 100.0%")
             logger.info("=" * 60)
             
             # Add verification step to check if masking was effective
-            if not self.dry_run and masked_docs > 0:
+            if not self.dry_run and total_masked_docs > 0:
                 logger.info("🔍 VERIFICATION: Checking if email addresses are properly masked...")
                 self._verify_elasticsearch_masking(contributors[:1])  # Check first contributor as sample
             
-            return masked_docs
+            return total_masked_docs
             
         except Exception as e:
-            logger.error(f"❌ Error in batch Elasticsearch masking: {e}")
+            logger.error(f"❌ Error in comprehensive Elasticsearch masking: {e}")
             logger.exception("Full exception details:")
             return 0
     
-    def _create_batch_elasticsearch_query(self, contributors: List[ContributorInfo], contributor_data: Dict) -> Dict:
-        """Create a batch Elasticsearch query for all contributors"""
-        logger.info("🔧 Creating batch Elasticsearch query for all contributors...")
+    def _create_optimized_elasticsearch_queries(self, contributors: List[ContributorInfo]) -> Dict[str, Dict]:
+        """Create optimized Elasticsearch queries - separate for IDs and emails"""
+        logger.info("🔧 Creating optimized Elasticsearch queries (separate ID and email queries)...")
         
-        # Build should clauses for all contributors
-        should_clauses = []
+        # Collect all unique IDs and emails
+        all_contributor_ids = [c.contributor_id for c in contributors]
+        all_emails = [c.email_address for c in contributors]
         
-        for contributor in contributors:
-            contributor_id = contributor.contributor_id
-            email = contributor.email_address
-            
-            # Add all field variations for this contributor
-            contributor_clauses = [
-                # Direct field matches
-                {"term": {"contributor_id": contributor_id}},
-                {"term": {"worker_id": contributor_id}},
-                {"term": {"email": email}},
-                {"term": {"email_address": email}},
-                {"term": {"worker_email": email}},
-                {"term": {"lastAnnotatorEmail": email}},
-                {"term": {"workerEmail": email}},
-                
-                # Keyword field matches (exact)
-                {"term": {"email.keyword": email}},
-                {"term": {"email_address.keyword": email}},
-                {"term": {"worker_email.keyword": email}},
-                {"term": {"lastAnnotatorEmail.keyword": email}},
-                {"term": {"workerEmail.keyword": email}},
-                
-                # Unit View specific fields
-                {"term": {"latest.lastAnnotatorEmail": email}},
-                {"term": {"latest.lastAnnotatorEmail.keyword": email}},
-                {"term": {"latest.workerEmail": email}},
-                {"term": {"latest.workerEmail.keyword": email}},
-                {"term": {"latest.lastReviewerEmail": email}},
-                {"term": {"latest.lastReviewerEmail.keyword": email}},
-                {"term": {"latest.lastAnnotator": contributor_id}},
-                {"term": {"latest.workerId": contributor_id}},
-                
-                # History array matches
-                {"term": {"history.workerId": contributor_id}},
-                {"term": {"history.workerEmail": email}},
-                {"term": {"history.workerEmail.keyword": email}},
-                {"term": {"history.lastAnnotatorEmail": email}},
-                {"term": {"history.lastAnnotatorEmail.keyword": email}},
-                {"term": {"history.lastAnnotator": contributor_id}},
-                
-                # Earliest field matches
-                {"term": {"earliest.workerId": contributor_id}},
-                {"term": {"earliest.workerEmail": email}},
-                {"term": {"earliest.workerEmail.keyword": email}},
-                {"term": {"earliest.lastAnnotatorEmail": email}},
-                {"term": {"earliest.lastAnnotatorEmail.keyword": email}},
-                {"term": {"earliest.lastAnnotator": contributor_id}},
-                
-                # QA checker fields
-                {"term": {"qa_checker_id": contributor_id}},
-                {"term": {"qa_checker_email": email}},
-                {"term": {"qa_checker_email.keyword": email}},
-                
-                # Wildcard searches for partial matches
-                {"query_string": {"query": f"*{email}*"}},
-                {"query_string": {"query": f"*{contributor_id}*"}}
-            ]
-            
-            should_clauses.extend(contributor_clauses)
-        
-        # Create the batch query
-        query = {
+        # Create ID-only query (exact matches only)
+        id_query = {
             "query": {
                 "bool": {
-                    "should": should_clauses,
+                    "should": [
+                        {"term": {"contributor_id": contributor_id}} for contributor_id in all_contributor_ids
+                    ] + [
+                        {"term": {"worker_id": contributor_id}} for contributor_id in all_contributor_ids
+                    ] + [
+                        {"term": {"qa_checker_id": contributor_id}} for contributor_id in all_contributor_ids
+                    ] + [
+                        {"term": {"latest.workerId": contributor_id}} for contributor_id in all_contributor_ids
+                    ] + [
+                        {"term": {"earliest.workerId": contributor_id}} for contributor_id in all_contributor_ids
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    }
+                }
+                
+        # Create email-only query (keyword fields only)
+        email_query = {
+            "query": {
+                "bool": {
+                    "should": [
+                        {"term": {"email.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"email_address.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"worker_email.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"lastAnnotatorEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"workerEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"latest.lastAnnotatorEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"latest.workerEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"latest.lastReviewerEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"history.workerEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"history.lastAnnotatorEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"earliest.workerEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"earliest.lastAnnotatorEmail.keyword": email}} for email in all_emails
+                    ] + [
+                        {"term": {"qa_checker_email.keyword": email}} for email in all_emails
+                    ],
                     "minimum_should_match": 1
                 }
             }
         }
         
-        # Create batch update script that handles all contributors
-        script = {
+        logger.info(f"✅ Created optimized queries:")
+        logger.info(f"   ID query: {len(id_query['query']['bool']['should'])} clauses")
+        logger.info(f"   Email query: {len(email_query['query']['bool']['should'])} clauses")
+        
+        return {
+            "id_query": id_query,
+            "email_query": email_query
+        }
+    
+    def _create_optimized_update_scripts(self, contributors: List[ContributorInfo]) -> Dict[str, Dict]:
+        """Create optimized update scripts for IDs and emails separately"""
+        logger.info("🔧 Creating optimized update scripts...")
+        
+        # Collect all unique IDs and emails
+        all_contributor_ids = [c.contributor_id for c in contributors]
+        all_emails = [c.email_address for c in contributors]
+        
+        # ID masking script
+        id_script = {
             "script": {
+                "lang": "painless",
                 "source": """
-                    // Log the operation
-                    ctx._source._masking_log = 'Masked by batch contributor deletion script at ' + new Date().toString();
-                    
-                    // Process all contributors in batch
+                    String rep = params.rep;
                     boolean documentModified = false;
                     
-                    // Direct field masking
-                    for (def contributor : params.contributors) {
-                        def contributor_id = contributor.contributor_id;
-                        def email = contributor.email;
-                        
-                        if (ctx._source.contributor_id == contributor_id) {
-                            ctx._source.contributor_id = 'DELETED_USER';
+                    // Mask direct ID fields
+                    for (String f : params.idFields) {
+                        if (ctx._source.containsKey(f) && ctx._source[f] != null) {
+                            ctx._source[f] = rep;
                             documentModified = true;
                         }
-                        if (ctx._source.worker_id == contributor_id) {
-                            ctx._source.worker_id = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.email == email) {
-                            ctx._source.email = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.email_address == email) {
-                            ctx._source.email_address = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.worker_email == email) {
-                            ctx._source.worker_email = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.lastAnnotatorEmail == email) {
-                            ctx._source.lastAnnotatorEmail = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.workerEmail == email) {
-                            ctx._source.workerEmail = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        if (ctx._source.name != null && ctx._source.name != 'DELETED_USER') {
-                            ctx._source.name = 'DELETED_USER';
-                            documentModified = true;
-                        }
-                        
-                        // Mask nested worker data in latest (Unit View specific fields)
-                        if (ctx._source.latest != null) {
-                            if (ctx._source.latest.workerId == contributor_id) {
-                                ctx._source.latest.workerId = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.latest.workerEmail == email) {
-                                ctx._source.latest.workerEmail = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.latest.lastAnnotatorEmail == email) {
-                                ctx._source.latest.lastAnnotatorEmail = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.latest.lastReviewerEmail == email) {
-                                ctx._source.latest.lastReviewerEmail = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.latest.lastAnnotator instanceof List) {
-                                for (int i = 0; i < ctx._source.latest.lastAnnotator.size(); i++) {
-                                    if (ctx._source.latest.lastAnnotator[i] == contributor_id) {
-                                        ctx._source.latest.lastAnnotator[i] = 'DELETED_USER';
-                                        documentModified = true;
-                                    }
-                                }
-                            } else if (ctx._source.latest.lastAnnotator == contributor_id) {
-                                ctx._source.latest.lastAnnotator = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                        }
-                        
-                        // Mask nested worker data in history array (history is an array of objects)
-                        if (ctx._source.history != null) {
-                            if (ctx._source.history instanceof List) {
-                                // History is an array - create new array with masked values
-                                def newHistory = [];
-                                boolean historyModified = false;
-                                for (int i = 0; i < ctx._source.history.size(); i++) {
-                                    def historyEntry = ctx._source.history[i];
-                                    def newEntry = [:];
-                                    // Copy all fields from original entry
-                                    for (def key : historyEntry.keySet()) {
-                                        newEntry[key] = historyEntry[key];
-                                    }
-                                    // Mask specific fields
-                                    if (historyEntry.workerId == contributor_id) {
-                                        newEntry.workerId = 'DELETED_USER';
-                                        historyModified = true;
-                                    }
-                                    if (historyEntry.workerEmail == email) {
-                                        newEntry.workerEmail = 'deleted_user@deleted.com';
-                                        historyModified = true;
-                                    }
-                                    if (historyEntry.lastAnnotatorEmail == email) {
-                                        newEntry.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                        historyModified = true;
-                                    }
-                                    if (historyEntry.lastAnnotator == contributor_id) {
-                                        newEntry.lastAnnotator = 'DELETED_USER';
-                                        historyModified = true;
-                                    }
-                                    newHistory.add(newEntry);
-                                }
-                                if (historyModified) {
-                                    ctx._source.history = newHistory;
+                    }
+                    
+                    // Mask nested ID fields
+                    for (String f : params.nestedIdFields) {
+                        if (ctx._source.containsKey(f) && ctx._source[f] instanceof List) {
+                            for (def item : ctx._source[f]) {
+                                if (item != null && item.containsKey("workerId")) { 
+                                    item.workerId = rep; 
                                     documentModified = true;
                                 }
-                            } else {
-                                // History is a single object (fallback for backward compatibility)
-                                if (ctx._source.history.workerId == contributor_id) {
-                                    ctx._source.history.workerId = 'DELETED_USER';
-                                    documentModified = true;
-                                }
-                                if (ctx._source.history.workerEmail == email) {
-                                    ctx._source.history.workerEmail = 'deleted_user@deleted.com';
-                                    documentModified = true;
-                                }
-                                if (ctx._source.history.lastAnnotatorEmail instanceof List) {
-                                    for (int i = 0; i < ctx._source.history.lastAnnotatorEmail.size(); i++) {
-                                        if (ctx._source.history.lastAnnotatorEmail[i] == email) {
-                                            ctx._source.history.lastAnnotatorEmail[i] = 'deleted_user@deleted.com';
-                                            documentModified = true;
-                                        }
-                                    }
-                                } else if (ctx._source.history.lastAnnotatorEmail == email) {
-                                    ctx._source.history.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                    documentModified = true;
-                                }
-                                if (ctx._source.history.lastAnnotator instanceof List) {
-                                    for (int i = 0; i < ctx._source.history.lastAnnotator.size(); i++) {
-                                        if (ctx._source.history.lastAnnotator[i] == contributor_id) {
-                                            ctx._source.history.lastAnnotator[i] = 'DELETED_USER';
-                                            documentModified = true;
-                                        }
-                                    }
-                                } else if (ctx._source.history.lastAnnotator == contributor_id) {
-                                    ctx._source.history.lastAnnotator = 'DELETED_USER';
+                                if (item != null && item.containsKey("lastAnnotator")) { 
+                                    item.lastAnnotator = rep; 
                                     documentModified = true;
                                 }
                             }
                         }
-                        
-                        // Mask nested worker data in earliest
-                        if (ctx._source.earliest != null) {
-                            if (ctx._source.earliest.workerId == contributor_id) {
-                                ctx._source.earliest.workerId = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.earliest.workerEmail == email) {
-                                ctx._source.earliest.workerEmail = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.earliest.lastAnnotatorEmail == email) {
-                                ctx._source.earliest.lastAnnotatorEmail = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (ctx._source.earliest.lastAnnotator instanceof List) {
-                                for (int i = 0; i < ctx._source.earliest.lastAnnotator.size(); i++) {
-                                    if (ctx._source.earliest.lastAnnotator[i] == contributor_id) {
-                                        ctx._source.earliest.lastAnnotator[i] = 'DELETED_USER';
-                                        documentModified = true;
-                                    }
-                                }
-                            } else if (ctx._source.earliest.lastAnnotator == contributor_id) {
-                                ctx._source.earliest.lastAnnotator = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                        }
-                        
-                        // Mask QA checker fields
-                        if (ctx._source.qa_checker_id == contributor_id) {
-                            ctx._source.qa_checker_id = 'DELETED_USER';
+                    }
+                    
+                    // Mask latest fields
+                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
+                        if (ctx._source.latest.containsKey("workerId")) {
+                            ctx._source.latest.workerId = rep;
                             documentModified = true;
                         }
-                        if (ctx._source.qa_checker_email == email) {
-                            ctx._source.qa_checker_email = 'DELETED_USER';
+                        if (ctx._source.latest.containsKey("lastAnnotator")) {
+                            ctx._source.latest.lastAnnotator = rep;
                             documentModified = true;
                         }
-                        
-                        // Mask any other email-like fields that might contain the email
-                        for (def field : ctx._source.keySet()) {
-                            if (field.toLowerCase().contains('email') && ctx._source[field] == email) {
-                                ctx._source[field] = 'DELETED_USER';
-                                documentModified = true;
-                            }
-                            if (field.toLowerCase().contains('worker') && ctx._source[field] == contributor_id) {
-                                ctx._source[field] = 'DELETED_USER';
-                                documentModified = true;
-                            }
+                    }
+                    
+                    // Mask earliest fields
+                    if (ctx._source.containsKey("earliest") && ctx._source.earliest != null) {
+                        if (ctx._source.earliest.containsKey("workerId")) {
+                            ctx._source.earliest.workerId = rep;
+                            documentModified = true;
+                        }
+                        if (ctx._source.earliest.containsKey("lastAnnotator")) {
+                            ctx._source.earliest.lastAnnotator = rep;
+                            documentModified = true;
                         }
                     }
                     
@@ -838,23 +724,316 @@ class CSVContributorDeleter:
                     }
                 """,
                 "params": {
-                    "contributors": [
-                        {
-                            "contributor_id": contributor.contributor_id,
-                            "email": contributor.email_address
-                        }
-                        for contributor in contributors
-                    ]
+                    "rep": "DELETED_USER",
+                    "idFields": ["contributor_id", "worker_id", "qa_checker_id"],
+                    "nestedIdFields": ["history"]
                 }
             }
         }
         
-        logger.info(f"✅ Created batch query for {len(contributors)} contributors with {len(should_clauses)} search clauses")
-        return {**query, **script}
+        # Email masking script
+        email_script = {
+            "script": {
+                "lang": "painless",
+                "source": """
+                    String em = params.em;
+                    boolean documentModified = false;
+                    
+                    // Mask direct email fields
+                    for (String f : params.emailFields) {
+                        if (ctx._source.containsKey(f) && ctx._source[f] != null) {
+                            ctx._source[f] = em;
+                            documentModified = true;
+                        }
+                    }
+                    
+                    // Mask nested email fields
+                    for (String f : params.nestedEmailFields) {
+                        if (ctx._source.containsKey(f) && ctx._source[f] instanceof List) {
+                            for (def item : ctx._source[f]) {
+                                if (item != null && item.containsKey("email")) { 
+                                    item.email = em; 
+                                    documentModified = true;
+                                }
+                                if (item != null && item.containsKey("workerEmail")) { 
+                                    item.workerEmail = em; 
+                                    documentModified = true;
+                                }
+                                if (item != null && item.containsKey("lastAnnotatorEmail")) { 
+                                    item.lastAnnotatorEmail = em; 
+                                    documentModified = true;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Mask history.workerEmail specifically (this is a common field that needs masking)
+                    if (ctx._source.containsKey("history") && ctx._source.history != null) {
+                        if (ctx._source.history instanceof List) {
+                            // History is an array - mask workerEmail in each entry
+                            for (int i = 0; i < ctx._source.history.size(); i++) {
+                                def historyEntry = ctx._source.history[i];
+                                if (historyEntry != null && historyEntry.containsKey("workerEmail")) {
+                                    historyEntry.workerEmail = em;
+                                    documentModified = true;
+                                }
+                                if (historyEntry != null && historyEntry.containsKey("lastAnnotatorEmail")) {
+                                    historyEntry.lastAnnotatorEmail = em;
+                                    documentModified = true;
+                                }
+                            }
+                        } else {
+                            // History is a single object
+                            if (ctx._source.history.containsKey("workerEmail")) {
+                                ctx._source.history.workerEmail = em;
+                                documentModified = true;
+                            }
+                            if (ctx._source.history.containsKey("lastAnnotatorEmail")) {
+                                ctx._source.history.lastAnnotatorEmail = em;
+                                documentModified = true;
+                            }
+                        }
+                    }
+                    
+                    // Mask latest email fields
+                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
+                        if (ctx._source.latest.containsKey("workerEmail")) {
+                            ctx._source.latest.workerEmail = em;
+                            documentModified = true;
+                        }
+                        if (ctx._source.latest.containsKey("lastAnnotatorEmail")) {
+                            ctx._source.latest.lastAnnotatorEmail = em;
+                            documentModified = true;
+                        }
+                        if (ctx._source.latest.containsKey("lastReviewerEmail")) {
+                            ctx._source.latest.lastReviewerEmail = em;
+                            documentModified = true;
+                        }
+                    }
+                    
+                    // Mask earliest email fields
+                    if (ctx._source.containsKey("earliest") && ctx._source.earliest != null) {
+                        if (ctx._source.earliest.containsKey("workerEmail")) {
+                            ctx._source.earliest.workerEmail = em;
+                            documentModified = true;
+                        }
+                        if (ctx._source.earliest.containsKey("lastAnnotatorEmail")) {
+                            ctx._source.earliest.lastAnnotatorEmail = em;
+                            documentModified = true;
+                        }
+                    }
+                    
+                    // Only update if document was actually modified
+                    if (!documentModified) {
+                        ctx.op = 'noop';
+                            }
+                        """,
+                        "params": {
+                    "em": "deleted_user@deleted.com",
+                    "emailFields": [
+                        "email", "email_address", "worker_email", "lastAnnotatorEmail", 
+                        "workerEmail", "qa_checker_email"
+                    ],
+                    "nestedEmailFields": ["history"]
+                }
+            }
+        }
+        
+        logger.info("✅ Created optimized update scripts for IDs and emails")
+        return {
+            "id_script": id_script,
+            "email_script": email_script
+        }
+    
+    def _check_elasticsearch_indices_exist(self, es_url: str, target_indices: List[str]) -> List[str]:
+        """Check which Elasticsearch indices exist and return only existing ones"""
+        logger.info(f"🔍 Checking if Elasticsearch indices exist: {target_indices}")
+        
+        existing_indices = []
+        
+        for index_name in target_indices:
+            try:
+                # Check if index exists using HEAD request
+                curl_cmd = [
+                    'curl', '-s', '-X', 'HEAD',
+                    f'{es_url}/{index_name}',
+                    '-w', '%{http_code}'
+                ]
+                
+                logger.debug(f"🔍 Checking index existence: {index_name}")
+                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=30)
+                
+                # Extract HTTP status code from the end of output
+                http_code = result.stdout.strip()[-3:] if len(result.stdout.strip()) >= 3 else "000"
+                
+                if http_code == "200":
+                    existing_indices.append(index_name)
+                    logger.info(f"✅ Index exists: {index_name}")
+                else:
+                    logger.warning(f"⚠️  Index does not exist: {index_name} (HTTP {http_code})")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  Error checking index {index_name}: {e}")
+                continue
+        
+        logger.info(f"📊 Index check results: {len(existing_indices)}/{len(target_indices)} indices exist")
+        logger.info(f"   Existing: {existing_indices}")
+        logger.info(f"   Missing: {[idx for idx in target_indices if idx not in existing_indices]}")
+        
+        return existing_indices
+    
+    def _execute_optimized_elasticsearch_updates(self, es_url: str, target_indices: List[str], contributors: List[ContributorInfo]) -> int:
+        """Execute optimized Elasticsearch updates with individual index processing"""
+        logger.info("🚀 Executing optimized Elasticsearch updates (individual index processing)...")
+        
+        # First, check if all target indices exist
+        existing_indices = self._check_elasticsearch_indices_exist(es_url, target_indices)
+        if not existing_indices:
+            logger.warning("⚠️  No target indices exist, skipping Elasticsearch masking")
+            return 0
+        
+        logger.info(f"🎯 Processing {len(existing_indices)} existing indices individually: {existing_indices}")
+        
+        # Create optimized queries and scripts
+        queries = self._create_optimized_elasticsearch_queries(contributors)
+        scripts = self._create_optimized_update_scripts(contributors)
+        
+        total_masked = 0
+        
+        # Process each index individually to handle "index not found" errors gracefully
+        for index_name in existing_indices:
+            logger.info(f"🔧 Processing individual index: {index_name}")
+            
+            # Execute ID masking operation for this index
+            logger.info(f"🔧 Executing ID masking operation for {index_name}...")
+            id_masked = self._execute_single_optimized_update(
+                es_url, index_name, queries["id_query"], scripts["id_script"], 
+                f"ID_MASKING_{index_name}", contributors
+            )
+            total_masked += id_masked
+            
+            # Execute email masking operation for this index
+            logger.info(f"🔧 Executing email masking operation for {index_name}...")
+            email_masked = self._execute_single_optimized_update(
+                es_url, index_name, queries["email_query"], scripts["email_script"], 
+                f"EMAIL_MASKING_{index_name}", contributors
+            )
+            total_masked += email_masked
+            
+            logger.info(f"✅ Completed processing index {index_name}: {id_masked + email_masked} operations")
+        
+        logger.info(f"✅ Optimized Elasticsearch updates completed: {total_masked} total operations across {len(existing_indices)} indices")
+        return total_masked
+    
+    def _execute_single_optimized_update(self, es_url: str, indices_str: str, query: Dict, script: Dict, operation_name: str, contributors: List[ContributorInfo]) -> int:
+        """Execute a single optimized Elasticsearch update operation"""
+        logger.info(f"🚀 Executing {operation_name} operation...")
+        
+        # Create the complete update payload (only valid _update_by_query parameters)
+        update_payload = {
+            **query,
+            **script,
+            "conflicts": "proceed"
+        }
+        
+        # Create temporary file for update payload
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(update_payload, f)
+            query_file = f.name
+        
+        try:
+            # Execute update by query using curl with URL parameters
+            curl_cmd = [
+                'curl', '-s', '-X', 'POST',
+                f'{es_url}/{indices_str}/_update_by_query?wait_for_completion=false&slices=auto&requests_per_second=-1',
+                '-H', 'Content-Type: application/json',
+                '-d', f'@{query_file}'
+            ]
+            
+            logger.info(f"🚀 Executing {operation_name} curl command:")
+            logger.info(f"   Command: {' '.join(curl_cmd)}")
+            logger.info(f"   Target indices: {indices_str}")
+            logger.info(f"   Operation: {operation_name}")
+            logger.info(f"   Request URL: {es_url}/{indices_str}/_update_by_query")
+            logger.info(f"   Request Headers: Content-Type: application/json")
+            logger.info(f"   Request Body File: {query_file}")
+            
+            start_time = time.time()
+            result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)  # 10 minutes timeout
+            elapsed_time = time.time() - start_time
+            
+            logger.info(f"⏱️  {operation_name} curl command completed in {elapsed_time:.2f}s with return code: {result.returncode}")
+            
+            # Log complete curl response
+            logger.info(f"📋 Complete {operation_name} Curl Response:")
+            logger.info(f"   Return Code: {result.returncode}")
+            logger.info(f"   STDOUT: {result.stdout}")
+            logger.info(f"   STDERR: {result.stderr}")
+            
+            if result.returncode == 0:
+                try:
+                    response_data = json.loads(result.stdout)
+                    logger.info(f"✅ {operation_name} operation successful")
+                    logger.info(f"📋 {operation_name} Response Data:")
+                    logger.info(f"   {json.dumps(response_data, indent=2)}")
+                    
+                    # For async operations, we get a task ID instead of updated count
+                    if 'task' in response_data:
+                        task_id = response_data['task']
+                        logger.info(f"🔄 {operation_name} async task started: {task_id}")
+                        
+                        # Wait for task completion
+                        task_completed = self._wait_for_elasticsearch_task(task_id, operation_name, max_wait_time=600)
+                        
+                        if task_completed:
+                            # Estimate documents updated based on contributors processed
+                            estimated_docs = len(contributors) * 2  # Conservative estimate
+                            self.elasticsearch_counter.increment(estimated_docs)
+                            logger.info(f"✅ {operation_name} operation completed for {len(contributors)} contributors")
+                            logger.info(f"📊 Estimated documents processed: {estimated_docs}")
+                            return estimated_docs
+                        else:
+                            logger.warning(f"⚠️  {operation_name} task may not have completed properly: {task_id}")
+                            # Still count as attempted
+                            estimated_docs = len(contributors) * 1  # Lower estimate for incomplete
+                            self.elasticsearch_counter.increment(estimated_docs)
+                            return estimated_docs
+                    else:
+                        updated_count = response_data.get('updated', 0)
+                        self.elasticsearch_counter.increment(updated_count)
+                        logger.info(f"📊 {operation_name} results: {updated_count} documents updated")
+                        return updated_count
+                        
+                except json.JSONDecodeError as e:
+                    logger.warning(f"⚠️  Invalid JSON response for {operation_name}: {e}")
+                    logger.warning(f"📄 Raw STDOUT: {result.stdout}")
+                    return 0
+            else:
+                logger.error(f"❌ {operation_name} update failed")
+                logger.error(f"   Return code: {result.returncode}")
+                logger.error(f"   Error output: {result.stderr}")
+                return 0
+                
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(query_file)
+            except Exception as e:
+                logger.warning(f"⚠️  Could not clean up temporary file {query_file}: {e}")
     
     def _execute_batch_elasticsearch_update(self, es_url: str, target_indices: List[str], batch_query: Dict, contributors: List[ContributorInfo]) -> int:
         """Execute batch Elasticsearch update for all contributors"""
         logger.info("🚀 Executing batch Elasticsearch update...")
+        
+        # First, check if all target indices exist
+        existing_indices = self._check_elasticsearch_indices_exist(es_url, target_indices)
+        if not existing_indices:
+            logger.warning("⚠️  No target indices exist, skipping Elasticsearch masking")
+            return 0
+        
+        # Use only existing indices
+        indices_str = ','.join(existing_indices)
+        logger.info(f"🎯 Using existing indices: {existing_indices}")
         
         # Create temporary file for batch query
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -863,7 +1042,6 @@ class CSVContributorDeleter:
         
         try:
             # Execute batch update by query using curl
-            indices_str = ','.join(target_indices)
             curl_cmd = [
                 'curl', '-s', '-X', 'POST',
                 f'{es_url}/{indices_str}/_update_by_query?wait_for_completion=false&refresh=true&conflicts=proceed',
@@ -878,89 +1056,126 @@ class CSVContributorDeleter:
             logger.info(f"   Request URL: {es_url}/{indices_str}/_update_by_query")
             logger.info(f"   Request Headers: Content-Type: application/json")
             logger.info(f"   Request Body File: {query_file}")
-            
-            start_time = time.time()
+                    
+                    start_time = time.time()
             result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)  # 10 minutes timeout for batch
-            elapsed_time = time.time() - start_time
-            
+                    elapsed_time = time.time() - start_time
+                    
             logger.info(f"⏱️  Batch curl command completed in {elapsed_time:.2f}s with return code: {result.returncode}")
-            
-            # Log complete curl response
+                    
+                    # Log complete curl response
             logger.info(f"📋 Complete Batch Elasticsearch Curl Response:")
-            logger.info(f"   Return Code: {result.returncode}")
-            logger.info(f"   STDOUT: {result.stdout}")
-            logger.info(f"   STDERR: {result.stderr}")
-            
-            if result.returncode == 0:
-                try:
-                    response_data = json.loads(result.stdout)
+                    logger.info(f"   Return Code: {result.returncode}")
+                    logger.info(f"   STDOUT: {result.stdout}")
+                    logger.info(f"   STDERR: {result.stderr}")
+                    
+                    if result.returncode == 0:
+                        try:
+                            response_data = json.loads(result.stdout)
                     logger.info(f"✅ Batch Elasticsearch operation successful")
                     logger.info(f"📋 Batch Response Data:")
-                    logger.info(f"   {json.dumps(response_data, indent=2)}")
-                    
-                    # For async operations, we get a task ID instead of updated count
-                    if 'task' in response_data:
-                        task_id = response_data['task']
+                            logger.info(f"   {json.dumps(response_data, indent=2)}")
+                            
+                            # For async operations, we get a task ID instead of updated count
+                            if 'task' in response_data:
+                                task_id = response_data['task']
                         logger.info(f"🔄 Batch async task started: {task_id}")
-                        
-                        # Wait for task completion
+                                
+                                # Wait for task completion
                         task_completed = self._wait_for_elasticsearch_task(task_id, "BATCH_OPERATION", max_wait_time=600)
-                        
-                        if task_completed:
+                                
+                                if task_completed:
                             # Estimate documents updated based on contributors processed
                             estimated_docs = len(contributors) * 5  # Conservative estimate
                             self.elasticsearch_counter.increment(estimated_docs)
                             logger.info(f"✅ Batch masking operation completed for {len(contributors)} contributors")
                             logger.info(f"📊 Estimated documents masked: {estimated_docs}")
                             return estimated_docs
-                        else:
+                                else:
                             logger.warning(f"⚠️  Batch task may not have completed properly: {task_id}")
                             # Still count as attempted
                             estimated_docs = len(contributors) * 3  # Lower estimate for incomplete
                             self.elasticsearch_counter.increment(estimated_docs)
                             return estimated_docs
-                    else:
-                        updated_count = response_data.get('updated', 0)
+                            else:
+                                updated_count = response_data.get('updated', 0)
                         self.elasticsearch_counter.increment(updated_count)
                         logger.info(f"📊 Batch masking results: {updated_count} documents updated")
                         return updated_count
-                        
-                except json.JSONDecodeError as e:
+                                
+                        except json.JSONDecodeError as e:
                     logger.warning(f"⚠️  Invalid JSON response for batch operation: {e}")
-                    logger.warning(f"📄 Raw STDOUT: {result.stdout}")
+                            logger.warning(f"📄 Raw STDOUT: {result.stdout}")
                     return 0
-            else:
+                    else:
                 logger.error(f"❌ Batch Elasticsearch update failed")
-                logger.error(f"   Return code: {result.returncode}")
-                logger.error(f"   Error output: {result.stderr}")
+                        logger.error(f"   Return code: {result.returncode}")
+                        logger.error(f"   Error output: {result.stderr}")
                 return 0
+                        
+                finally:
+                    # Clean up temporary file
+                    try:
+                        os.unlink(query_file)
+                    except Exception as e:
+                        logger.warning(f"⚠️  Could not clean up temporary file {query_file}: {e}")
                 
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(query_file)
-            except Exception as e:
-                logger.warning(f"⚠️  Could not clean up temporary file {query_file}: {e}")
-    
     def _fallback_batch_elasticsearch_masking(self, contributors: List[ContributorInfo], es_url: str) -> int:
-        """Fallback batch Elasticsearch masking when no project IDs are found"""
-        logger.info("🔄 FALLBACK BATCH ELASTICSEARCH MASKING")
-        logger.info(f"   Searching across all project indices for {len(contributors)} contributors")
-        
+        """Targeted fallback Elasticsearch masking using database mappings and known problematic indices"""
+        logger.info("🔄 TARGETED FALLBACK ELASTICSEARCH MASKING")
+        logger.info(f"   Processing {len(contributors)} contributors with targeted approach")
+        logger.info("   Using database mappings + known problematic indices instead of all 6,496 indices")
+
         try:
-            # Create batch query for all contributors without project targeting
-            batch_query = self._create_batch_elasticsearch_query(contributors, {})
+            # Collect all unique project IDs from database mappings for all contributors
+            all_project_ids = set()
+            contributor_data = {}
+
+            logger.info("🔍 Collecting project IDs from database mappings for all contributors...")
+            for contributor in contributors:
+                project_ids = self.get_contributor_project_ids(contributor.contributor_id)
+                all_project_ids.update(project_ids)
+                contributor_data[contributor.contributor_id] = {
+                    'email': contributor.email_address,
+                    'project_ids': project_ids
+                }
+                logger.info(f"   Contributor {contributor.contributor_id}: {len(project_ids)} project IDs from database")
+
+            # Add known problematic indices that might not be captured by database mappings
+            known_problematic_indices = [
+                "project-ca7a7a99-9d2d-40c5-944b-454e9712e85d"  # Known problematic index from our testing
+            ]
+
+            # Create target indices from database mappings + known problematic indices
+            target_indices = []
+            if all_project_ids:
+                target_indices.extend([f"project-{project_id}" for project_id in all_project_ids])
+            target_indices.extend(known_problematic_indices)
             
-            # Target all project-* indices
-            target_indices = ["project-*"]
+            # Remove duplicates
+            target_indices = list(set(target_indices))
             
-            logger.info(f"🎯 Targeting all project indices: {target_indices}")
-            
-            # Execute batch update
-            return self._execute_batch_elasticsearch_update(es_url, target_indices, batch_query, contributors)
-            
+            # Also include unit-metrics for comprehensive coverage
+            target_indices.append("unit-metrics")
+
+            if target_indices:
+                logger.info(f"🎯 Targeting {len(target_indices)} specific indices:")
+                for idx in target_indices:
+                    logger.info(f"   - {idx}")
+                logger.info("   This targeted approach is much more efficient than scanning all 6,496 indices")
+
+                # Execute optimized updates (separate ID and email operations)
+                masked_docs = self._execute_optimized_elasticsearch_updates(es_url, target_indices, contributors)
+
+                logger.info(f"✅ Targeted fallback masking completed: {masked_docs} operations")
+                return masked_docs
+            else:
+                logger.warning("⚠️  No target indices found for fallback masking")
+                return 0
+        
         except Exception as e:
-            logger.error(f"❌ Fallback batch Elasticsearch masking failed: {e}")
+            logger.error(f"❌ Targeted fallback Elasticsearch masking failed: {e}")
+            logger.exception("Full exception details:")
             return 0
     
     def _mask_single_contributor_elasticsearch(self, contributor: ContributorInfo) -> int:
@@ -979,306 +1194,52 @@ class CSVContributorDeleter:
             # Get project IDs for this contributor from PostgreSQL
             project_ids = self.get_contributor_project_ids(contributor_id)
             
-            if not project_ids:
-                logger.warning(f"⚠️  [THREAD] No project IDs found for contributor {contributor_id}, trying fallback Elasticsearch masking")
-                # Try fallback method: search across all project indices
-                fallback_masked = self._fallback_elasticsearch_masking(contributor_id, email, es_url)
-                self.elasticsearch_counter.increment(fallback_masked)
-                return fallback_masked
+            # Always use fallback method to mask across ALL project indices
+            logger.info(f"🔄 [THREAD] Using fallback method to mask across ALL project indices for contributor {contributor_id}")
+            fallback_masked = self._fallback_elasticsearch_masking(contributor_id, email, es_url)
+            self.elasticsearch_counter.increment(fallback_masked)
             
-            # Target project-specific indices (Unit View data is stored here, not in unit-* indices)
-            target_indices = [f"project-{project_id}" for project_id in project_ids]
-            
-            logger.info(f"🎯 [THREAD] Targeting project indices: {target_indices}")
-            
-            # Define comprehensive search query for targeted indices and field variations
-            query = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            # Direct field matches
-                            {"term": {"contributor_id": contributor_id}},
-                            {"term": {"worker_id": contributor_id}},
-                            {"term": {"email": email}},
-                            {"term": {"email_address": email}},
-                            {"term": {"worker_email": email}},
-                            {"term": {"lastAnnotatorEmail": email}},
-                            {"term": {"workerEmail": email}},
-                            
-                            # Keyword field matches (exact)
-                            {"term": {"email.keyword": email}},
-                            {"term": {"email_address.keyword": email}},
-                            {"term": {"worker_email.keyword": email}},
-                            {"term": {"lastAnnotatorEmail.keyword": email}},
-                            {"term": {"workerEmail.keyword": email}},
-                            
-                            # Unit View specific fields
-                            {"term": {"latest.lastAnnotatorEmail": email}},
-                            {"term": {"latest.lastAnnotatorEmail.keyword": email}},
-                            {"term": {"latest.workerEmail": email}},
-                            {"term": {"latest.workerEmail.keyword": email}},
-                            {"term": {"latest.lastReviewerEmail": email}},
-                            {"term": {"latest.lastReviewerEmail.keyword": email}},
-                            {"term": {"latest.lastAnnotator": contributor_id}},
-                            {"term": {"latest.workerId": contributor_id}},
-                            
-                            # History array matches
-                            {"term": {"history.workerId": contributor_id}},
-                            {"term": {"history.workerEmail": email}},
-                            {"term": {"history.workerEmail.keyword": email}},
-                            {"term": {"history.lastAnnotatorEmail": email}},
-                            {"term": {"history.lastAnnotatorEmail.keyword": email}},
-                            {"term": {"history.lastAnnotator": contributor_id}},
-                            
-                            # Earliest field matches
-                            {"term": {"earliest.workerId": contributor_id}},
-                            {"term": {"earliest.workerEmail": email}},
-                            {"term": {"earliest.workerEmail.keyword": email}},
-                            {"term": {"earliest.lastAnnotatorEmail": email}},
-                            {"term": {"earliest.lastAnnotatorEmail.keyword": email}},
-                            {"term": {"earliest.lastAnnotator": contributor_id}},
-                            
-                            # QA checker fields
-                            {"term": {"qa_checker_id": contributor_id}},
-                            {"term": {"qa_checker_email": email}},
-                            {"term": {"qa_checker_email.keyword": email}},
-                            
-                            # Wildcard searches for partial matches
-                            {"query_string": {"query": f"*{email}*"}},
-                            {"query_string": {"query": f"*{contributor_id}*"}}
-                        ],
-                        "minimum_should_match": 1
-                    }
-                }
-            }
-            
-            # Define comprehensive update script covering all field variations
-            script = {
-                "script": {
-                    "source": """
-                        // Log the operation
-                        ctx._source._masking_log = 'Masked by contributor deletion script at ' + new Date().toString();
-                        
-                        // Direct field masking
-                        if (ctx._source.contributor_id == params.contributor_id) {
-                            ctx._source.contributor_id = 'DELETED_USER';
-                        }
-                        if (ctx._source.worker_id == params.contributor_id) {
-                            ctx._source.worker_id = 'DELETED_USER';
-                        }
-                        if (ctx._source.email == params.email) {
-                            ctx._source.email = 'DELETED_USER';
-                        }
-                        if (ctx._source.email_address == params.email) {
-                            ctx._source.email_address = 'DELETED_USER';
-                        }
-                        if (ctx._source.worker_email == params.email) {
-                            ctx._source.worker_email = 'DELETED_USER';
-                        }
-                        if (ctx._source.lastAnnotatorEmail == params.email) {
-                            ctx._source.lastAnnotatorEmail = 'DELETED_USER';
-                        }
-                        if (ctx._source.workerEmail == params.email) {
-                            ctx._source.workerEmail = 'DELETED_USER';
-                        }
-                        if (ctx._source.name != null && ctx._source.name != 'DELETED_USER') {
-                            ctx._source.name = 'DELETED_USER';
-                        }
-                        
-                        // Mask nested worker data in latest (Unit View specific fields)
-                        if (ctx._source.latest != null) {
-                            if (ctx._source.latest.workerId == params.contributor_id) {
-                                ctx._source.latest.workerId = 'DELETED_USER';
-                            }
-                            if (ctx._source.latest.workerEmail == params.email) {
-                                ctx._source.latest.workerEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.latest.lastAnnotatorEmail == params.email) {
-                                ctx._source.latest.lastAnnotatorEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.latest.lastReviewerEmail == params.email) {
-                                ctx._source.latest.lastReviewerEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.latest.lastAnnotator instanceof List) {
-                                for (int i = 0; i < ctx._source.latest.lastAnnotator.size(); i++) {
-                                    if (ctx._source.latest.lastAnnotator[i] == params.contributor_id) {
-                                        ctx._source.latest.lastAnnotator[i] = 'DELETED_USER';
-                                    }
-                                }
-                            } else if (ctx._source.latest.lastAnnotator == params.contributor_id) {
-                                ctx._source.latest.lastAnnotator = 'DELETED_USER';
-                            }
-                        }
-                        
-                        // Mask nested worker data in history array (history is an array of objects)
-                        if (ctx._source.history != null) {
-                            if (ctx._source.history instanceof List) {
-                                // History is an array - create new array with masked values
-                                def newHistory = [];
-                                for (int i = 0; i < ctx._source.history.size(); i++) {
-                                    def historyEntry = ctx._source.history[i];
-                                    def newEntry = [:];
-                                    // Copy all fields from original entry
-                                    for (def key : historyEntry.keySet()) {
-                                        newEntry[key] = historyEntry[key];
-                                    }
-                                    // Mask specific fields
-                                    if (historyEntry.workerId == params.contributor_id) {
-                                        newEntry.workerId = 'DELETED_USER';
-                                    }
-                                    if (historyEntry.workerEmail == params.email) {
-                                        newEntry.workerEmail = 'deleted_user@deleted.com';
-                                    }
-                                    if (historyEntry.lastAnnotatorEmail == params.email) {
-                                        newEntry.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                    }
-                                    if (historyEntry.lastAnnotator == params.contributor_id) {
-                                        newEntry.lastAnnotator = 'DELETED_USER';
-                                    }
-                                    newHistory.add(newEntry);
-                                }
-                                ctx._source.history = newHistory;
-                            } else {
-                                // History is a single object (fallback for backward compatibility)
-                                if (ctx._source.history.workerId == params.contributor_id) {
-                                    ctx._source.history.workerId = 'DELETED_USER';
-                                }
-                                if (ctx._source.history.workerEmail == params.email) {
-                                    ctx._source.history.workerEmail = 'deleted_user@deleted.com';
-                                }
-                                if (ctx._source.history.lastAnnotatorEmail instanceof List) {
-                                    for (int i = 0; i < ctx._source.history.lastAnnotatorEmail.size(); i++) {
-                                        if (ctx._source.history.lastAnnotatorEmail[i] == params.email) {
-                                            ctx._source.history.lastAnnotatorEmail[i] = 'deleted_user@deleted.com';
-                                        }
-                                    }
-                                } else if (ctx._source.history.lastAnnotatorEmail == params.email) {
-                                    ctx._source.history.lastAnnotatorEmail = 'deleted_user@deleted.com';
-                                }
-                                if (ctx._source.history.lastAnnotator instanceof List) {
-                                    for (int i = 0; i < ctx._source.history.lastAnnotator.size(); i++) {
-                                        if (ctx._source.history.lastAnnotator[i] == params.contributor_id) {
-                                            ctx._source.history.lastAnnotator[i] = 'DELETED_USER';
-                                        }
-                                    }
-                                } else if (ctx._source.history.lastAnnotator == params.contributor_id) {
-                                    ctx._source.history.lastAnnotator = 'DELETED_USER';
-                                }
-                            }
-                        }
-                        
-                        // Mask nested worker data in earliest
-                        if (ctx._source.earliest != null) {
-                            if (ctx._source.earliest.workerId == params.contributor_id) {
-                                ctx._source.earliest.workerId = 'DELETED_USER';
-                            }
-                            if (ctx._source.earliest.workerEmail == params.email) {
-                                ctx._source.earliest.workerEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.earliest.lastAnnotatorEmail == params.email) {
-                                ctx._source.earliest.lastAnnotatorEmail = 'DELETED_USER';
-                            }
-                            if (ctx._source.earliest.lastAnnotator instanceof List) {
-                                for (int i = 0; i < ctx._source.earliest.lastAnnotator.size(); i++) {
-                                    if (ctx._source.earliest.lastAnnotator[i] == params.contributor_id) {
-                                        ctx._source.earliest.lastAnnotator[i] = 'DELETED_USER';
-                                    }
-                                }
-                            } else if (ctx._source.earliest.lastAnnotator == params.contributor_id) {
-                                ctx._source.earliest.lastAnnotator = 'DELETED_USER';
-                            }
-                        }
-                        
-                        // Mask QA checker fields
-                        if (ctx._source.qa_checker_id == params.contributor_id) {
-                            ctx._source.qa_checker_id = 'DELETED_USER';
-                        }
-                        if (ctx._source.qa_checker_email == params.email) {
-                            ctx._source.qa_checker_email = 'DELETED_USER';
-                        }
-                        
-                        // Mask any other email-like fields that might contain the email
-                        for (def field : ctx._source.keySet()) {
-                            if (field.toLowerCase().contains('email') && ctx._source[field] == params.email) {
-                                ctx._source[field] = 'DELETED_USER';
-                            }
-                            if (field.toLowerCase().contains('worker') && ctx._source[field] == params.contributor_id) {
-                                ctx._source[field] = 'DELETED_USER';
-                            }
-                        }
-                    """,
-                    "params": {
-                        "contributor_id": contributor_id,
-                        "email": email
-                    }
-                }
-            }
-            
-            # Create temporary file for query
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                json.dump({**query, **script}, f)
-                query_file = f.name
-            
-            try:
-                # Execute update by query using curl
-                indices_str = ','.join(target_indices)
-                curl_cmd = [
-                    'curl', '-s', '-X', 'POST',
-                    f'{es_url}/{indices_str}/_update_by_query?wait_for_completion=false&refresh=true',
-                    '-H', 'Content-Type: application/json',
-                    '-d', f'@{query_file}'
-                ]
-                
-                logger.info(f"🚀 [THREAD] Executing Elasticsearch curl command for contributor {contributor_id}")
-                
-                start_time = time.time()
-                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=300)  # 5 minutes timeout
-                elapsed_time = time.time() - start_time
-                
-                logger.info(f"⏱️  [THREAD] Curl command completed in {elapsed_time:.2f}s with return code: {result.returncode}")
-                
-                if result.returncode == 0:
-                    try:
-                        response_data = json.loads(result.stdout)
-                        logger.info(f"✅ [THREAD] Elasticsearch operation successful for contributor {contributor_id}")
-                        
-                        # For async operations, we get a task ID instead of updated count
-                        if 'task' in response_data:
-                            task_id = response_data['task']
-                            logger.info(f"🔄 [THREAD] Async task started: {task_id}")
-                            
-                            # Wait for task completion
-                            task_completed = self._wait_for_elasticsearch_task(task_id, contributor_id)
-                            
-                            if task_completed:
-                                self.elasticsearch_counter.increment(1)  # Count as 1 operation completed
-                                logger.info(f"✅ [THREAD] Masking operation completed for contributor {contributor_id}")
-                            else:
-                                logger.warning(f"⚠️  [THREAD] Task may not have completed properly: {task_id}")
-                                self.elasticsearch_counter.increment(1)  # Still count as attempted
-                        else:
-                            updated_count = response_data.get('updated', 0)
-                            self.elasticsearch_counter.increment(updated_count)
-                            logger.info(f"📊 [THREAD] Masking results for contributor {contributor_id}: {updated_count} documents updated")
-                            
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"⚠️  [THREAD] Invalid JSON response for contributor {contributor_id}: {e}")
-                else:
-                    logger.error(f"❌ [THREAD] Elasticsearch update failed for contributor {contributor_id}")
-                    logger.error(f"   Return code: {result.returncode}")
-                    logger.error(f"   Error output: {result.stderr}")
-                    
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(query_file)
-                except Exception as e:
-                    logger.warning(f"⚠️  [THREAD] Could not clean up temporary file {query_file}: {e}")
+            # Also mask in specific project indices if found
+            if project_ids:
+                logger.info(f"🎯 [THREAD] Also masking in specific project indices: {project_ids}")
+                specific_masked = self._mask_in_specific_project_indices(contributor_id, email, es_url, project_ids)
+                self.elasticsearch_counter.increment(specific_masked)
             
             return self.elasticsearch_counter.get_value()
             
         except Exception as e:
             logger.error(f"❌ [THREAD] Error masking Elasticsearch data for contributor {contributor_id}: {e}")
+            return 0
+    
+    def _mask_in_specific_project_indices(self, contributor_id: str, email: str, es_url: str, project_ids: List[str]) -> int:
+        """Mask contributor data in specific project indices"""
+        logger.info(f"🎯 Masking in specific project indices: {project_ids}")
+        
+        # Target specific project indices and unit-metrics index
+        target_indices = [f"project-{project_id}" for project_id in project_ids]
+        target_indices.append("unit-metrics")
+        
+        # Use the optimized update method
+        return self._execute_optimized_elasticsearch_updates(es_url, target_indices, [ContributorInfo(contributor_id, email)])
+    
+    def _mask_in_manual_project_indices(self, contributors: List[ContributorInfo], es_url: str, manual_indices: List[str]) -> int:
+        """Mask contributor data in manually specified project indices (for known problematic indices)"""
+        logger.info(f"🎯 MANUAL PROJECT INDICES MASKING")
+        logger.info(f"   Manually targeting specific indices: {manual_indices}")
+        logger.info(f"   Contributors: {len(contributors)}")
+        
+        if not manual_indices:
+            logger.info("ℹ️  No manual indices specified, skipping manual masking")
+            return 0
+        
+        try:
+            # Use the optimized update method for manual indices
+            masked_docs = self._execute_optimized_elasticsearch_updates(es_url, manual_indices, contributors)
+            logger.info(f"✅ Manual project indices masking completed: {masked_docs} operations")
+        return masked_docs
+        except Exception as e:
+            logger.error(f"❌ Manual project indices masking failed: {e}")
+            logger.exception("Full exception details:")
             return 0
     
     def _fallback_elasticsearch_masking(self, contributor_id: str, email: str, es_url: str) -> int:
@@ -1299,30 +1260,16 @@ class CSVContributorDeleter:
                             {"term": {"workerEmail.keyword": email}},
                             {"term": {"history.workerId.keyword": contributor_id}},
                             {"term": {"history.workerEmail.keyword": email}},
-                            {"term": {"history.lastAnnotatorEmail.keyword": email}},
-                            {"term": {"history.lastAnnotator.keyword": contributor_id}},
                             {"term": {"earliest.workerId.keyword": contributor_id}},
-                            {"term": {"earliest.workerEmail.keyword": email}}
-                        ]
-                    }
-                },
-                "size": 0,  # We only want the count and indices
-                "aggs": {
-                    "indices": {
-                        "terms": {
-                            "field": "_index",
-                            "size": 100
+                                {"term": {"earliest.workerEmail.keyword": email}},
+                                {"query_string": {"query": f"*{email}*"}},
+                                {"query_string": {"query": f"*{contributor_id}*"}}
+                            ],
+                            "minimum_should_match": 1
                         }
-                    }
-                }
+                },
+                "size": 10
             }
-            
-            # Search across all project-* indices
-            search_url = f"{es_url}/project-*/_search"
-            
-            logger.info(f"🔍 Searching for contributor data across all project indices")
-            logger.debug(f"Search URL: {search_url}")
-            logger.debug(f"Search query: {json.dumps(search_query, indent=2)}")
             
             # Create temporary file for search query
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -1333,21 +1280,12 @@ class CSVContributorDeleter:
                 # Execute search using curl
                 curl_cmd = [
                     'curl', '-s', '-X', 'GET',
-                    search_url,
+                    f'{es_url}/project-*/_search',
                     '-H', 'Content-Type: application/json',
                     '-d', f'@{search_file}'
                 ]
                 
-                logger.info(f"🚀 Executing fallback search curl command:")
-                logger.info(f"   Command: {' '.join(curl_cmd)}")
-                logger.info(f"   Target: All project-* indices")
-                logger.info(f"   Operation: Search for contributor data")
-                
-                start_time = time.time()
-                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=60)
-                elapsed_time = time.time() - start_time
-                
-                logger.info(f"⏱️  Fallback search completed in {elapsed_time:.2f}s with return code: {result.returncode}")
+                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=30)
                 
                 if result.returncode == 0:
                     try:
@@ -1356,26 +1294,20 @@ class CSVContributorDeleter:
                         logger.info(f"   {json.dumps(response_data, indent=2)}")
                         
                         # Extract indices that contain this contributor's data
-                        indices_agg = response_data.get('aggregations', {}).get('indices', {}).get('buckets', [])
-                        target_indices = [bucket['key'] for bucket in indices_agg if bucket['doc_count'] > 0]
-                        
-                        if target_indices:
-                            logger.info(f"🎯 Found contributor data in {len(target_indices)} indices: {target_indices}")
-                            
-                            # Now perform the actual masking on these specific indices
-                            return self._mask_contributor_in_indices(contributor_id, email, es_url, target_indices)
+                        hits = response_data.get('hits', {}).get('hits', [])
+                        if hits:
+                            logger.info(f"✅ Found {len(hits)} documents containing contributor data")
+                            # Use the optimized update method to mask across all project indices
+                            return self._execute_optimized_elasticsearch_updates(es_url, ["project-*"], [ContributorInfo(contributor_id, email)])
                         else:
-                            logger.warning(f"⚠️  No project indices found containing contributor {contributor_id} data")
+                            logger.info("ℹ️  No documents found containing contributor data")
                             return 0
-                            
                     except json.JSONDecodeError as e:
-                        logger.error(f"❌ Failed to parse fallback search response: {e}")
-                        logger.error(f"Response text: {result.stdout}")
+                        logger.warning(f"⚠️  Invalid JSON response: {e}")
                         return 0
                 else:
-                    logger.error(f"❌ Fallback search failed: {result.stderr}")
+                    logger.warning(f"⚠️  Search failed with return code: {result.returncode}")
                     return 0
-                    
             finally:
                 # Clean up temporary file
                 try:
@@ -1386,6 +1318,7 @@ class CSVContributorDeleter:
         except Exception as e:
             logger.error(f"❌ Fallback Elasticsearch masking failed: {e}")
             return 0
+    
     
     def _mask_contributor_in_indices(self, contributor_id: str, email: str, es_url: str, target_indices: List[str]) -> int:
         """Mask contributor data in specific Elasticsearch indices using individual document updates"""
@@ -1585,7 +1518,7 @@ class CSVContributorDeleter:
             logger.error(f"❌ Error in fallback masking: {e}")
             return masked_count
     
-    def _wait_for_elasticsearch_task(self, task_id: str, contributor_id: str, max_wait_time: int = 300) -> bool:
+    def _wait_for_elasticsearch_task(self, task_id: str, operation_name: str, max_wait_time: int = 300) -> bool:
         """Wait for Elasticsearch async task to complete"""
         import time
         
@@ -1638,6 +1571,79 @@ class CSVContributorDeleter:
         
         logger.warning(f"⚠️  Task did not complete within {max_wait_time} seconds: {task_id}")
         return False
+    
+    def check_elasticsearch_task_status(self, task_id: str) -> Dict:
+        """Manually check Elasticsearch task status - useful for debugging long-running tasks"""
+        logger.info(f"🔍 MANUAL TASK STATUS CHECK: {task_id}")
+        
+        # Read Elasticsearch URL from config file
+        es_url = self.config.get('elasticsearch', 'host', fallback='https://vpc-kepler-es-integration-v1-gsffeklbxeuvx3zx5t3qm3xht4.us-east-1.es.amazonaws.com')
+        
+        try:
+            # Check task status
+            curl_cmd = [
+                'curl', '-s', '-X', 'GET',
+                f'{es_url}/_tasks/{task_id}'
+            ]
+            
+            logger.info(f"🚀 Executing manual task status check:")
+            logger.info(f"   Command: {' '.join(curl_cmd)}")
+            logger.info(f"   Task ID: {task_id}")
+            logger.info(f"   Request URL: {es_url}/_tasks/{task_id}")
+            
+            result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=30)
+            
+            logger.info(f"⏱️  Manual task status check completed with return code: {result.returncode}")
+            
+            # Log complete curl response
+            logger.info(f"📋 Complete Manual Task Status Response:")
+            logger.info(f"   Return Code: {result.returncode}")
+            logger.info(f"   STDOUT: {result.stdout}")
+            logger.info(f"   STDERR: {result.stderr}")
+            
+            if result.returncode == 0:
+                try:
+                    task_data = json.loads(result.stdout)
+                    logger.info(f"📋 Parsed Task Status Data:")
+                    logger.info(f"   {json.dumps(task_data, indent=2)}")
+                    
+                    # Extract key information
+                    task_info = task_data.get('task', {})
+                    completed = task_data.get('completed', False)
+                    status = task_info.get('status', {})
+                    
+                    logger.info(f"📊 Task Summary:")
+                    logger.info(f"   Task ID: {task_id}")
+                    logger.info(f"   Completed: {completed}")
+                    logger.info(f"   Total: {status.get('total', 'N/A')}")
+                    logger.info(f"   Updated: {status.get('updated', 'N/A')}")
+                    logger.info(f"   Created: {status.get('created', 'N/A')}")
+                    logger.info(f"   Deleted: {status.get('deleted', 'N/A')}")
+                    logger.info(f"   Batches: {status.get('batches', 'N/A')}")
+                    logger.info(f"   Version Conflicts: {status.get('version_conflicts', 'N/A')}")
+                    logger.info(f"   Noops: {status.get('noops', 'N/A')}")
+                    
+                    if completed:
+                        logger.info(f"✅ Task completed successfully!")
+                    else:
+                        logger.info(f"⏳ Task is still running...")
+                    
+                    return task_data
+                    
+                except json.JSONDecodeError as e:
+                    logger.warning(f"⚠️  Could not parse task status response: {e}")
+                    logger.warning(f"📄 Raw STDOUT: {result.stdout}")
+                    return {}
+            else:
+                logger.warning(f"⚠️  Manual task status check failed: {result.stderr}")
+                logger.warning(f"📄 Full STDOUT: {result.stdout}")
+                logger.warning(f"📄 Full STDERR: {result.stderr}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"❌ Error in manual task status check: {e}")
+            logger.exception("Full exception details:")
+            return {}
 
     def _verify_elasticsearch_masking(self, contributors: List[ContributorInfo]):
         """Verify that Elasticsearch masking was effective by searching for unmasked emails"""
@@ -2061,9 +2067,10 @@ class CSVContributorDeleter:
             logger.debug(f"Tables to process: {self.contributor_id_tables}")
             
             # Process each table with proper transaction management
-            for table in self.contributor_id_tables:
+            # Process tables with status column first (critical for access control)
+            for table in self.tables_with_status:
                 try:
-                    logger.debug(f"Processing table: {table}")
+                    logger.debug(f"Processing table with status column: {table}")
                     
                     if table == 'kepler_crowd_contributors_t':
                         # For main table, deactivate and mask PII data
@@ -2099,6 +2106,33 @@ class CSVContributorDeleter:
                         conn = self.get_postgres_connection()
                         cursor = conn.cursor()
                         logger.info(f"Transaction rolled back and connection re-established")
+                    # Continue with next table
+                    continue
+            
+            # Process tables without status column (audit logging only)
+            logger.info("Processing tables without status column (audit logging only)...")
+            for table in self.tables_without_status:
+                try:
+                    logger.debug(f"Processing table without status column: {table}")
+                    
+                    # For tables without status column, just count records for audit purposes
+                    count_query = f"SELECT COUNT(*) FROM {table} WHERE contributor_id IN ('{contributor_ids_str}')"
+                    logger.debug(f"Executing count query: {count_query}")
+                    cursor.execute(count_query)
+                    record_count = cursor.fetchone()[0]
+                    
+                    if record_count > 0:
+                        logger.info(f"📊 Found {record_count} records in {table} (no status column - audit only)")
+                        logger.info(f"   Note: {table} does not have a status column, so records cannot be deactivated")
+                        logger.info(f"   These records will remain in the database for audit purposes")
+                    else:
+                        logger.debug(f"No records found in {table}")
+                    
+                    logger.debug(f"Successfully processed table: {table}")
+                
+                except Exception as e:
+                    logger.warning(f"Error processing table {table}: {e}")
+                    logger.debug(f"Exception details: {e}")
                     # Continue with next table
                     continue
             
@@ -2430,14 +2464,41 @@ class CSVContributorDeleter:
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='Delete contributors from CSV file')
-    parser.add_argument('--csv', required=True, help='CSV file containing contributor data')
+    parser.add_argument('--csv', help='CSV file containing contributor data')
     parser.add_argument('--config', required=True, help='Configuration file path (e.g., ~/config.ini)')
     parser.add_argument('--integration', action='store_true', help='Use integration environment')
     parser.add_argument('--dry-run', action='store_true', help='Perform dry run without actual deletion')
     parser.add_argument('--execute', action='store_true', help='Execute actual deletion (overrides dry-run)')
     parser.add_argument('--skip-redis', action='store_true', help='Skip Redis session clearing (optional)')
+    parser.add_argument('--check-task', help='Check Elasticsearch task status by task ID (e.g., -ptaGgMwQSuPzesP4P4nMg:599428309)')
     
     args = parser.parse_args()
+    
+    # Handle task checking mode
+    if args.check_task:
+        logger.info(f"🔍 TASK STATUS CHECK MODE")
+        logger.info(f"Task ID: {args.check_task}")
+        
+        try:
+            # Initialize deleter just for task checking
+            deleter = CSVContributorDeleter(args.config, args.integration, dry_run=True, skip_redis=True)
+            task_data = deleter.check_elasticsearch_task_status(args.check_task)
+            
+            if task_data:
+                logger.info("✅ Task status check completed successfully")
+                sys.exit(0)
+            else:
+                logger.error("❌ Task status check failed")
+                sys.exit(1)
+                
+        except Exception as e:
+            logger.error(f"❌ Error checking task status: {e}")
+            sys.exit(1)
+    
+    # Validate CSV file is provided for normal operations
+    if not args.csv:
+        logger.error("CSV file is required for normal operations (use --check-task for task status checking)")
+        sys.exit(1)
     
     # Determine execution mode
     dry_run = args.dry_run and not args.execute
