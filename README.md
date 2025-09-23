@@ -1,6 +1,6 @@
 # ADAP-QF-utils
 
-A collection of utility scripts and tools for ADAP Quality Framework (QF) operations and testing.
+A collection of utility scripts and tools for ADAP QF operations and testing.
 
 ## Overview
 
