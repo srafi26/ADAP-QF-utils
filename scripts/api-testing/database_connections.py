@@ -173,25 +173,39 @@ class DatabaseConnections:
             logger.debug(f"   Found {len(secondary_project_ids)} additional project IDs from stats: {secondary_project_ids}")
             
             # TERTIARY METHOD: Check team mappings (if contributor is part of teams)
-            tertiary_query = """
-                SELECT DISTINCT project_id 
-                FROM kepler_crowd_contributors_team_mapping_t 
-                WHERE contributor_id = %s 
-                AND project_id IS NOT NULL
-            """
-            
-            logger.debug(f"🔍 TERTIARY METHOD - Checking team mappings")
-            logger.debug(f"   Query: {tertiary_query}")
-            
+            # First check if the table and column exist
             tertiary_project_ids = []  # Initialize variable
             try:
-                cursor.execute(tertiary_query, (contributor_id,))
-                results3 = cursor.fetchall()
-                tertiary_project_ids = [row[0] for row in results3 if row[0]]
-                project_ids.update(tertiary_project_ids)
-                logger.debug(f"   Found {len(tertiary_project_ids)} additional project IDs from teams: {tertiary_project_ids}")
+                # Check if table exists and has project_id column
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.columns 
+                        WHERE table_schema = 'public' 
+                        AND table_name = 'kepler_crowd_contributors_team_mapping_t'
+                        AND column_name = 'project_id'
+                    )
+                """)
+                
+                if cursor.fetchone()[0]:
+                    tertiary_query = """
+                        SELECT DISTINCT project_id 
+                        FROM kepler_crowd_contributors_team_mapping_t 
+                        WHERE contributor_id = %s 
+                        AND project_id IS NOT NULL
+                    """
+                    
+                    logger.debug(f"🔍 TERTIARY METHOD - Checking team mappings")
+                    logger.debug(f"   Query: {tertiary_query}")
+                    
+                    cursor.execute(tertiary_query, (contributor_id,))
+                    results3 = cursor.fetchall()
+                    tertiary_project_ids = [row[0] for row in results3 if row[0]]
+                    project_ids.update(tertiary_project_ids)
+                    logger.debug(f"   Found {len(tertiary_project_ids)} additional project IDs from teams: {tertiary_project_ids}")
+                else:
+                    logger.debug(f"   Team mapping table does not have project_id column, skipping")
             except Exception as team_error:
-                logger.debug(f"   Team mapping query failed (table might not exist): {team_error}")
+                logger.debug(f"   Team mapping query failed: {team_error}")
             
             # QUATERNARY METHOD: Check job relationships and distribution segment tables
             # These provide additional project associations through job mappings and actual work data
