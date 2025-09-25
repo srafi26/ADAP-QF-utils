@@ -26,6 +26,7 @@ ADAP-QF-utils/
 
 ### Comprehensive Documentation
 - **[docs/README.md](docs/README.md)** - Complete documentation index and overview
+- **[docs/contributor_deletion_system.md](docs/contributor_deletion_system.md)** - **NEW**: Complete contributor deletion system documentation
 - **[docs/COMPREHENSIVE_USAGE_GUIDE.md](docs/COMPREHENSIVE_USAGE_GUIDE.md)** - Detailed usage guide with examples and troubleshooting
 - **[docs/COMPLETE_SEQUENCE_GUIDE.md](docs/COMPLETE_SEQUENCE_GUIDE.md)** - Step-by-step sequence guide for contributor deletion
 - **[docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** - Quick reference for common commands and operations
@@ -34,8 +35,9 @@ ADAP-QF-utils/
 
 ### Quick Start
 1. **New Users**: Start with [docs/QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)
-2. **Step-by-Step**: Follow [docs/COMPLETE_SEQUENCE_GUIDE.md](docs/COMPLETE_SEQUENCE_GUIDE.md)
-3. **Detailed Info**: Read [docs/COMPREHENSIVE_USAGE_GUIDE.md](docs/COMPREHENSIVE_USAGE_GUIDE.md)
+2. **Contributor Deletion**: Read [docs/contributor_deletion_system.md](docs/contributor_deletion_system.md)
+3. **Step-by-Step**: Follow [docs/COMPLETE_SEQUENCE_GUIDE.md](docs/COMPLETE_SEQUENCE_GUIDE.md)
+4. **Detailed Info**: Read [docs/COMPREHENSIVE_USAGE_GUIDE.md](docs/COMPREHENSIVE_USAGE_GUIDE.md)
 
 ## Available Scripts
 
@@ -50,8 +52,25 @@ Tests the fetch and commit APIs for contributors to verify they can access the s
 - Verifies if deleted contributors can still access the system
 - Useful for testing contributor deletion system integrity
 
-#### `delete_contributors_csv.py`
-Comprehensive contributor deletion script that removes contributor data from multiple systems.
+#### `contributor_deletion.py` (Main Production Script)
+**NEW**: Comprehensive contributor deletion system with advanced Elasticsearch masking and dynamic project discovery.
+
+**Purpose:**
+- Deletes contributors from PostgreSQL database with PII masking
+- Advanced Elasticsearch masking with defensive normalization for mixed data types
+- ClickHouse analytics data masking with precise email replacement
+- Dynamic project discovery across sharded distribution tables
+- Multi-phase Elasticsearch approach for comprehensive coverage
+- Real-time verification and comprehensive logging
+
+**Key Features:**
+- **Defensive Normalization**: Handles strings, arrays, and pipe-separated values in Elasticsearch
+- **Dynamic Project Discovery**: Automatically finds all project associations
+- **Multi-Phase Masking**: Targeted approach instead of scanning all 6,496 indices
+- **Verification**: Post-deletion verification to ensure complete masking
+
+#### `delete_contributors_csv.py` (Legacy)
+Legacy contributor deletion script (deprecated in favor of `contributor_deletion.py`).
 
 **Purpose:**
 - Deletes contributors from PostgreSQL database
@@ -88,7 +107,26 @@ Unit routing automation script for testing workflows.
 - API testing integration
 - Combined workflow automation
 
-**Usage:**
+**Usage (New Main Script):**
+```bash
+# Dry run first (recommended)
+python3 scripts/api-testing/contributor_deletion.py --contributor-id <ID> --email <EMAIL> --config ~/config_integration.ini --dry-run
+
+# Live execution
+python3 scripts/api-testing/contributor_deletion.py --contributor-id <ID> --email <EMAIL> --config ~/config_integration.ini --execute
+
+# Example with real contributor
+python3 scripts/api-testing/contributor_deletion.py --contributor-id 0b5adcd5-1a5f-424e-a9d2-bb312caacac7 --email MHUHMB@appen.com --config ~/config_integration.ini --execute
+```
+
+**Options:**
+- `--contributor-id`: Contributor ID (required)
+- `--email`: Email address (required)
+- `--config`: Configuration file path (required)
+- `--dry-run`: Perform dry run without actual deletion
+- `--execute`: Execute actual deletion (overrides dry-run)
+
+**Legacy Usage (Deprecated):**
 ```bash
 # Dry run to see what would be deleted
 python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config.ini --dry-run
@@ -103,7 +141,7 @@ python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --c
 python scripts/api-testing/delete_contributors_csv.py --csv contributors.csv --config ~/config.ini --execute --skip-redis
 ```
 
-**Options:**
+**Legacy Options:**
 - `--csv`: CSV file containing contributor data (required)
 - `--config`: Configuration file path (required)
 - `--integration`: Use integration environment settings
