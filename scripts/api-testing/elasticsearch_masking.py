@@ -85,28 +85,40 @@ class ElasticsearchMasking:
                 logger.info("ℹ️  No specific project IDs found in database mappings - Phase 1 fallback should have covered everything")
                 logger.info("✅ Phase 2 skipped (no database mappings)")
             
-            # PHASE 3: Manual targeting of known problematic indices (if any)
-            logger.info("🔧 PHASE 3: MANUAL PROJECT INDICES MASKING (KNOWN PROBLEMATIC INDICES)")
+            # PHASE 3: Dynamic project discovery (if database mappings are insufficient)
+            logger.info("🔧 PHASE 3: DYNAMIC PROJECT DISCOVERY (IF NEEDED)")
             logger.info("-" * 50)
             
-            # Define known problematic indices that might not be captured by database mappings
-            known_problematic_indices = [
-                "project-ca7a7a99-9d2d-40c5-944b-454e9712e85d"  # Known problematic index from our testing
-            ]
-            
-            # Filter out indices that were already targeted in Phase 2
-            already_targeted = [f"project-{pid}" for pid in all_project_ids]
-            manual_indices = [idx for idx in known_problematic_indices if idx not in already_targeted]
-            
+            # Check if we need to discover additional project indices dynamically
+            # This phase is only needed if database mappings are insufficient
+            manual_indices = []
             manual_masked = 0  # Initialize variable
-            if manual_indices:
-                logger.info(f"🔧 Targeting {len(manual_indices)} known problematic indices: {manual_indices}")
-                manual_masked = self._mask_in_manual_project_indices(contributors, es_url, manual_indices)
-                total_masked_docs += manual_masked
-                logger.info(f"✅ Phase 3 completed: {manual_masked} operations")
+            
+            # Only run dynamic discovery if we have very few project IDs from database mappings
+            if len(all_project_ids) < 3:  # Threshold for insufficient project coverage
+                logger.info("🔍 Database mappings found limited project coverage, attempting dynamic discovery...")
+                
+                # Try to discover project indices dynamically by searching for contributor data
+                discovered_indices = self._discover_project_indices_dynamically(contributors, es_url)
+                if discovered_indices:
+                    # Filter out indices that were already targeted in Phase 2
+                    already_targeted = [f"project-{pid}" for pid in all_project_ids]
+                    manual_indices = [idx for idx in discovered_indices if idx not in already_targeted]
+                    
+                    if manual_indices:
+                        logger.info(f"🔧 Discovered {len(manual_indices)} additional project indices: {manual_indices}")
+                        manual_masked = self._mask_in_manual_project_indices(contributors, es_url, manual_indices)
+                        total_masked_docs += manual_masked
+                        logger.info(f"✅ Phase 3 completed: {manual_masked} operations")
+                    else:
+                        logger.info("ℹ️  No additional project indices discovered beyond database mappings")
+                        logger.info("✅ Phase 3 skipped (no additional indices found)")
+                else:
+                    logger.info("ℹ️  No additional project indices discovered")
+                    logger.info("✅ Phase 3 skipped (no additional indices found)")
             else:
-                logger.info("ℹ️  No additional manual indices needed - all known problematic indices already covered")
-                logger.info("✅ Phase 3 skipped (no additional manual indices)")
+                logger.info("ℹ️  Database mappings provided sufficient project coverage")
+                logger.info("✅ Phase 3 skipped (sufficient project coverage from database mappings)")
             
             # Calculate specific masked counts for summary
             specific_masked = total_masked_docs - fallback_masked - manual_masked
@@ -216,59 +228,102 @@ class ElasticsearchMasking:
         all_contributor_ids = [c.contributor_id for c in contributors]
         all_emails = [c.email_address for c in contributors]
         
-        # ID masking script
+        # ID masking script with pipe-separated contributor support
         id_script = {
             "script": {
                 "lang": "painless",
                 "source": """
                     String rep = params.rep;
+                    String[] targetIds = params.targetIds;
                     boolean documentModified = false;
                     
-                    // Mask direct ID fields
+                    // Helper function to mask specific ID in pipe-separated string
+                    def maskIdInPipeSeparatedString(String fieldValue, String[] targetIds, String replacement) {
+                        if (fieldValue == null || fieldValue.isEmpty()) {
+                            return fieldValue;
+                        }
+                        
+                        String result = fieldValue;
+                        for (String targetId : targetIds) {
+                            if (targetId != null && !targetId.isEmpty()) {
+                                // Handle pipe-separated lists: "id1 | id2 | id3"
+                                if (result.contains(" | ")) {
+                                    // Split by pipe and process each part
+                                    String[] parts = result.split(" \\| ");
+                                    for (int i = 0; i < parts.length; i++) {
+                                        String part = parts[i].trim();
+                                        if (part.equals(targetId)) {
+                                            parts[i] = replacement;
+                                        }
+                                    }
+                                    result = String.join(" | ", parts);
+                                } else if (result.equals(targetId)) {
+                                    // Single ID match
+                                    result = replacement;
+                                }
+                            }
+                        }
+                        return result;
+                    }
+                    
+                    // Mask direct ID fields with pipe-separated support
                     for (String f : params.idFields) {
                         if (ctx._source.containsKey(f) && ctx._source[f] != null) {
-                            ctx._source[f] = rep;
-                            documentModified = true;
+                            String originalValue = ctx._source[f].toString();
+                            String maskedValue = maskIdInPipeSeparatedString(originalValue, targetIds, rep);
+                            if (!originalValue.equals(maskedValue)) {
+                                ctx._source[f] = maskedValue;
+                                documentModified = true;
+                            }
                         }
                     }
                     
-                    // Mask nested ID fields
+                    // Mask nested ID fields with pipe-separated support
                     for (String f : params.nestedIdFields) {
                         if (ctx._source.containsKey(f) && ctx._source[f] instanceof List) {
                             for (def item : ctx._source[f]) {
-                                if (item != null && item.containsKey("workerId")) { 
-                                    item.workerId = rep; 
-                                    documentModified = true;
+                                if (item != null) {
+                                    // Process ID fields in nested objects
+                                    for (String idField : ["workerId", "lastAnnotator"]) {
+                                        if (item.containsKey(idField) && item[idField] != null) {
+                                            String originalValue = item[idField].toString();
+                                            String maskedValue = maskIdInPipeSeparatedString(originalValue, targetIds, rep);
+                                            if (!originalValue.equals(maskedValue)) {
+                                                item[idField] = maskedValue;
+                                                documentModified = true;
+                                            }
+                                        }
+                                    }
                                 }
-                                if (item != null && item.containsKey("lastAnnotator")) { 
-                                    item.lastAnnotator = rep; 
+                            }
+                        }
+                    }
+                    
+                    // Mask latest fields with pipe-separated support
+                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
+                        for (String idField : ["workerId", "lastAnnotator"]) {
+                            if (ctx._source.latest.containsKey(idField) && ctx._source.latest[idField] != null) {
+                                String originalValue = ctx._source.latest[idField].toString();
+                                String maskedValue = maskIdInPipeSeparatedString(originalValue, targetIds, rep);
+                                if (!originalValue.equals(maskedValue)) {
+                                    ctx._source.latest[idField] = maskedValue;
                                     documentModified = true;
                                 }
                             }
                         }
                     }
                     
-                    // Mask latest fields
-                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
-                        if (ctx._source.latest.containsKey("workerId")) {
-                            ctx._source.latest.workerId = rep;
-                            documentModified = true;
-                        }
-                        if (ctx._source.latest.containsKey("lastAnnotator")) {
-                            ctx._source.latest.lastAnnotator = rep;
-                            documentModified = true;
-                        }
-                    }
-                    
-                    // Mask earliest fields
+                    // Mask earliest fields with pipe-separated support
                     if (ctx._source.containsKey("earliest") && ctx._source.earliest != null) {
-                        if (ctx._source.earliest.containsKey("workerId")) {
-                            ctx._source.earliest.workerId = rep;
-                            documentModified = true;
-                        }
-                        if (ctx._source.earliest.containsKey("lastAnnotator")) {
-                            ctx._source.earliest.lastAnnotator = rep;
-                            documentModified = true;
+                        for (String idField : ["workerId", "lastAnnotator"]) {
+                            if (ctx._source.earliest.containsKey(idField) && ctx._source.earliest[idField] != null) {
+                                String originalValue = ctx._source.earliest[idField].toString();
+                                String maskedValue = maskIdInPipeSeparatedString(originalValue, targetIds, rep);
+                                if (!originalValue.equals(maskedValue)) {
+                                    ctx._source.earliest[idField] = maskedValue;
+                                    documentModified = true;
+                                }
+                            }
                         }
                     }
                     
@@ -279,101 +334,143 @@ class ElasticsearchMasking:
                 """,
                 "params": {
                     "rep": "DELETED_USER",
+                    "targetIds": [c.contributor_id for c in contributors],
                     "idFields": ["contributor_id", "worker_id", "qa_checker_id"],
                     "nestedIdFields": ["history"]
                 }
             }
         }
         
-        # Email masking script
+        # Email masking script with pipe-separated contributor support
         email_script = {
             "script": {
                 "lang": "painless",
                 "source": """
                     String em = params.em;
+                    String[] targetEmails = params.targetEmails;
                     boolean documentModified = false;
                     
-                    // Mask direct email fields
+                    // Helper function to mask specific email in pipe-separated string
+                    def maskEmailInPipeSeparatedString(String fieldValue, String[] targetEmails, String replacement) {
+                        if (fieldValue == null || fieldValue.isEmpty()) {
+                            return fieldValue;
+                        }
+                        
+                        String result = fieldValue;
+                        for (String targetEmail : targetEmails) {
+                            if (targetEmail != null && !targetEmail.isEmpty()) {
+                                // Handle pipe-separated lists: "email1@test.com | email2@test.com | email3@test.com"
+                                if (result.contains(" | ")) {
+                                    // Split by pipe and process each part
+                                    String[] parts = result.split(" \\| ");
+                                    for (int i = 0; i < parts.length; i++) {
+                                        String part = parts[i].trim();
+                                        if (part.equals(targetEmail)) {
+                                            parts[i] = replacement;
+                                        }
+                                    }
+                                    result = String.join(" | ", parts);
+                                } else if (result.equals(targetEmail)) {
+                                    // Single email match
+                                    result = replacement;
+                                }
+                            }
+                        }
+                        return result;
+                    }
+                    
+                    // Mask direct email fields with pipe-separated support
                     for (String f : params.emailFields) {
                         if (ctx._source.containsKey(f) && ctx._source[f] != null) {
-                            ctx._source[f] = em;
-                            documentModified = true;
+                            String originalValue = ctx._source[f].toString();
+                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                            if (!originalValue.equals(maskedValue)) {
+                                ctx._source[f] = maskedValue;
+                                documentModified = true;
+                            }
                         }
                     }
                     
-                    // Mask nested email fields
+                    // Mask nested email fields with pipe-separated support
                     for (String f : params.nestedEmailFields) {
                         if (ctx._source.containsKey(f) && ctx._source[f] instanceof List) {
                             for (def item : ctx._source[f]) {
-                                if (item != null && item.containsKey("email")) { 
-                                    item.email = em; 
-                                    documentModified = true;
-                                }
-                                if (item != null && item.containsKey("workerEmail")) { 
-                                    item.workerEmail = em; 
-                                    documentModified = true;
-                                }
-                                if (item != null && item.containsKey("lastAnnotatorEmail")) { 
-                                    item.lastAnnotatorEmail = em; 
-                                    documentModified = true;
+                                if (item != null) {
+                                    // Process email fields in nested objects
+                                    for (String emailField : ["email", "workerEmail", "lastAnnotatorEmail"]) {
+                                        if (item.containsKey(emailField) && item[emailField] != null) {
+                                            String originalValue = item[emailField].toString();
+                                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                                            if (!originalValue.equals(maskedValue)) {
+                                                item[emailField] = maskedValue;
+                                                documentModified = true;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     
-                    // Mask history.workerEmail specifically (this is a common field that needs masking)
+                    // Mask history.workerEmail with pipe-separated support
                     if (ctx._source.containsKey("history") && ctx._source.history != null) {
                         if (ctx._source.history instanceof List) {
                             // History is an array - mask workerEmail in each entry
                             for (int i = 0; i < ctx._source.history.size(); i++) {
                                 def historyEntry = ctx._source.history[i];
-                                if (historyEntry != null && historyEntry.containsKey("workerEmail")) {
-                                    historyEntry.workerEmail = em;
-                                    documentModified = true;
-                                }
-                                if (historyEntry != null && historyEntry.containsKey("lastAnnotatorEmail")) {
-                                    historyEntry.lastAnnotatorEmail = em;
-                                    documentModified = true;
+                                if (historyEntry != null) {
+                                    for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
+                                        if (historyEntry.containsKey(emailField) && historyEntry[emailField] != null) {
+                                            String originalValue = historyEntry[emailField].toString();
+                                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                                            if (!originalValue.equals(maskedValue)) {
+                                                historyEntry[emailField] = maskedValue;
+                                                documentModified = true;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else {
                             // History is a single object
-                            if (ctx._source.history.containsKey("workerEmail")) {
-                                ctx._source.history.workerEmail = em;
-                                documentModified = true;
-                            }
-                            if (ctx._source.history.containsKey("lastAnnotatorEmail")) {
-                                ctx._source.history.lastAnnotatorEmail = em;
-                                documentModified = true;
+                            for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
+                                if (ctx._source.history.containsKey(emailField) && ctx._source.history[emailField] != null) {
+                                    String originalValue = ctx._source.history[emailField].toString();
+                                    String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                                    if (!originalValue.equals(maskedValue)) {
+                                        ctx._source.history[emailField] = maskedValue;
+                                        documentModified = true;
+                                    }
+                                }
                             }
                         }
                     }
                     
-                    // Mask latest email fields
+                    // Mask latest email fields with pipe-separated support
                     if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
-                        if (ctx._source.latest.containsKey("workerEmail")) {
-                            ctx._source.latest.workerEmail = em;
-                            documentModified = true;
-                        }
-                        if (ctx._source.latest.containsKey("lastAnnotatorEmail")) {
-                            ctx._source.latest.lastAnnotatorEmail = em;
-                            documentModified = true;
-                        }
-                        if (ctx._source.latest.containsKey("lastReviewerEmail")) {
-                            ctx._source.latest.lastReviewerEmail = em;
-                            documentModified = true;
+                        for (String emailField : ["workerEmail", "lastAnnotatorEmail", "lastReviewerEmail"]) {
+                            if (ctx._source.latest.containsKey(emailField) && ctx._source.latest[emailField] != null) {
+                                String originalValue = ctx._source.latest[emailField].toString();
+                                String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                                if (!originalValue.equals(maskedValue)) {
+                                    ctx._source.latest[emailField] = maskedValue;
+                                    documentModified = true;
+                                }
+                            }
                         }
                     }
                     
-                    // Mask earliest email fields
+                    // Mask earliest email fields with pipe-separated support
                     if (ctx._source.containsKey("earliest") && ctx._source.earliest != null) {
-                        if (ctx._source.earliest.containsKey("workerEmail")) {
-                            ctx._source.earliest.workerEmail = em;
-                            documentModified = true;
-                        }
-                        if (ctx._source.earliest.containsKey("lastAnnotatorEmail")) {
-                            ctx._source.earliest.lastAnnotatorEmail = em;
-                            documentModified = true;
+                        for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
+                            if (ctx._source.earliest.containsKey(emailField) && ctx._source.earliest[emailField] != null) {
+                                String originalValue = ctx._source.earliest[emailField].toString();
+                                String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
+                                if (!originalValue.equals(maskedValue)) {
+                                    ctx._source.earliest[emailField] = maskedValue;
+                                    documentModified = true;
+                                }
+                            }
                         }
                     }
                     
@@ -384,6 +481,7 @@ class ElasticsearchMasking:
                 """,
                 "params": {
                     "em": "deleted_user@deleted.com",
+                    "targetEmails": [c.email_address for c in contributors],
                     "emailFields": [
                         "email", "email_address", "worker_email", "lastAnnotatorEmail", 
                         "workerEmail", "qa_checker_email"
@@ -745,20 +843,14 @@ class ElasticsearchMasking:
         logger.info("   Using database mappings + known problematic indices instead of all 6,496 indices")
 
         try:
-            # Add known problematic indices that might not be captured by database mappings
-            known_problematic_indices = [
-                "project-ca7a7a99-9d2d-40c5-944b-454e9712e85d"  # Known problematic index from our testing
-            ]
-
-            # Create target indices from known problematic indices
+            # Create target indices for fallback masking
             target_indices = []
-            target_indices.extend(known_problematic_indices)
+            
+            # Include unit-metrics for comprehensive coverage
+            target_indices.append("unit-metrics")
             
             # Remove duplicates
             target_indices = list(set(target_indices))
-            
-            # Also include unit-metrics for comprehensive coverage
-            target_indices.append("unit-metrics")
 
             if target_indices:
                 logger.info(f"🎯 Targeting {len(target_indices)} specific indices:")
@@ -780,10 +872,108 @@ class ElasticsearchMasking:
             logger.exception("Full exception details:")
             return 0
     
+    def _discover_project_indices_dynamically(self, contributors: List[ContributorInfo], es_url: str) -> List[str]:
+        """Dynamically discover project indices that contain contributor data"""
+        logger.info("🔍 DYNAMIC PROJECT INDEX DISCOVERY")
+        logger.info(f"   Searching for project indices containing contributor data...")
+        logger.info(f"   Contributors: {len(contributors)}")
+        
+        discovered_indices = []
+        
+        try:
+            # Get list of all project indices from Elasticsearch
+            curl_cmd = [
+                'curl', '-s', '-X', 'GET',
+                f'{es_url}/_cat/indices/project-*?format=json'
+            ]
+            
+            logger.info("🚀 Executing project index discovery:")
+            logger.info(f"   Command: {' '.join(curl_cmd)}")
+            logger.info(f"   Request URL: {es_url}/_cat/indices/project-*")
+            
+            result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                try:
+                    import json
+                    indices_data = json.loads(result.stdout)
+                    
+                    # Extract index names
+                    all_project_indices = [idx.get('index', '') for idx in indices_data if idx.get('index', '').startswith('project-')]
+                    
+                    logger.info(f"📊 Found {len(all_project_indices)} project indices in Elasticsearch")
+                    
+                    # Sample a few indices to check for contributor data (to avoid scanning all indices)
+                    # Limit to first 10 indices to avoid performance issues
+                    sample_indices = all_project_indices[:10]
+                    
+                    for index_name in sample_indices:
+                        if self._check_index_contains_contributor_data(index_name, contributors, es_url):
+                            discovered_indices.append(index_name)
+                            logger.info(f"✅ Found contributor data in index: {index_name}")
+                    
+                    logger.info(f"🎯 Discovered {len(discovered_indices)} indices with contributor data: {discovered_indices}")
+                    
+                except json.JSONDecodeError as e:
+                    logger.warning(f"⚠️  Could not parse project indices response: {e}")
+                    logger.warning(f"📄 Raw response: {result.stdout}")
+            else:
+                logger.warning(f"⚠️  Project index discovery failed: {result.stderr}")
+                logger.warning(f"📄 Full STDOUT: {result.stdout}")
+                logger.warning(f"📄 Full STDERR: {result.stderr}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️  Error in dynamic project discovery: {e}")
+            logger.debug(f"Exception details: {e}")
+        
+        return discovered_indices
+    
+    def _check_index_contains_contributor_data(self, index_name: str, contributors: List[ContributorInfo], es_url: str) -> bool:
+        """Check if a specific index contains data for any of the contributors"""
+        try:
+            # Create a simple search query to check if the index contains contributor data
+            search_query = {
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"term": {"contributor_id": contributor.contributor_id}} for contributor in contributors
+                        ] + [
+                            {"term": {"email": contributor.email_address}} for contributor in contributors
+                        ],
+                        "minimum_should_match": 1
+                    }
+                },
+                "size": 1
+            }
+            
+            # Execute search query
+            curl_cmd = [
+                'curl', '-s', '-X', 'GET',
+                f'{es_url}/{index_name}/_search',
+                '-H', 'Content-Type: application/json',
+                '-d', json.dumps(search_query)
+            ]
+            
+            result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                try:
+                    response_data = json.loads(result.stdout)
+                    hits = response_data.get('hits', {}).get('hits', [])
+                    return len(hits) > 0
+                except json.JSONDecodeError:
+                    return False
+            else:
+                return False
+                
+        except Exception as e:
+            logger.debug(f"Error checking index {index_name}: {e}")
+            return False
+    
     def _mask_in_manual_project_indices(self, contributors: List[ContributorInfo], es_url: str, manual_indices: List[str]) -> int:
-        """Mask contributor data in manually specified project indices (for known problematic indices)"""
+        """Mask contributor data in manually specified project indices (for discovered indices)"""
         logger.info(f"🎯 MANUAL PROJECT INDICES MASKING")
-        logger.info(f"   Manually targeting specific indices: {manual_indices}")
+        logger.info(f"   Targeting discovered indices: {manual_indices}")
         logger.info(f"   Contributors: {len(contributors)}")
         
         if not manual_indices:

@@ -127,35 +127,39 @@ class ClickHouseMasking:
                         # ClickHouse uses ALTER TABLE ... UPDATE syntax
                         # CRITICAL FINDING: contributor_id is a key column and CANNOT be updated
                         # Only email columns can be masked in ClickHouse tables
+                        # Handle pipe-separated contributor lists properly
                         if 'accrued_contributor_stats' in table:
                             # This table only has email column, no contributor_id
+                            # Handle pipe-separated email lists: "email1@test.com | email2@test.com | email3@test.com"
                             update_query = f"""
                             ALTER TABLE {table} 
                             UPDATE 
-                                email = 'deleted_user@deleted.com'
+                                email = replaceAll(email, '{email}', 'deleted_user@deleted.com')
                             WHERE 
-                                email = '{email}'
+                                email LIKE '%{email}%'
                             """
                         elif 'unit_metrics_topic' in table:
                             # Kafka table - mutations not supported, but we'll try anyway for completeness
+                            # Handle pipe-separated email lists
                             update_query = f"""
                             ALTER TABLE {table} 
                             UPDATE 
-                                email = 'deleted_user@deleted.com'
+                                email = replaceAll(email, '{email}', 'deleted_user@deleted.com')
                             WHERE 
                                 contributor_id = '{contributor_id}' 
-                                OR email = '{email}'
+                                OR email LIKE '%{email}%'
                             """
                         else:
                             # Tables with contributor_id (unit_metrics, unit_metrics_hourly)
                             # We can only update email column, not contributor_id (key column)
+                            # Handle pipe-separated email lists
                             update_query = f"""
                             ALTER TABLE {table} 
                             UPDATE 
-                                email = 'deleted_user@deleted.com'
+                                email = replaceAll(email, '{email}', 'deleted_user@deleted.com')
                             WHERE 
                                 contributor_id = '{contributor_id}' 
-                                OR email = '{email}'
+                                OR email LIKE '%{email}%'
                             """
                         
                         logger.info(f"📝 ClickHouse UPDATE Query for table {table}:")
