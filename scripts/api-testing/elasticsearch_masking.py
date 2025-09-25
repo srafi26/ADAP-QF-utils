@@ -423,143 +423,168 @@ class ElasticsearchMasking:
             }
         }
         
-        # Email masking script with pipe-separated contributor support
+        # Email masking script with defensive normalization approach
         email_script = {
             "script": {
                 "lang": "painless",
                 "source": """
+                    // Convert any String/Array/null into a mutable List<String>
+                    def toList(def v) {
+                      if (v == null) return new ArrayList();
+                      if (v instanceof List) return new ArrayList(v);        // copy
+                      // Handle pipe-separated strings or singletons
+                      String s = v.toString();
+                      if (s.indexOf(" | ") >= 0) {
+                        ArrayList list = new ArrayList();
+                        int start = 0;
+                        int pos = s.indexOf(" | ");
+                        while (pos >= 0) {
+                          list.add(s.substring(start, pos).trim());
+                          start = pos + 3;
+                          pos = s.indexOf(" | ", start);
+                        }
+                        list.add(s.substring(start).trim());
+                        return list;
+                      }
+                      ArrayList list = new ArrayList(); list.add(s); return list;
+                    }
+                    
+                    // Convert back to original shape (preserve types)
+                    def fromList(def original, List list) {
+                      if (original instanceof List) return list;             // keep as array
+                      if (original == null) return String.join(" | ", list); // choose a stable format
+                      String s = original.toString();
+                      if (s.indexOf(" | ") >= 0) return String.join(" | ", list);
+                      // was a scalar; preserve scalar if single item, otherwise join
+                      return list.size() == 1 ? list.get(0) : String.join(" | ", list);
+                    }
+                    
+                    // Replace matching emails in a normalized list
+                    boolean maskEmails(List list, List targets, String replacement) {
+                      boolean modified = false;
+                      for (int i = 0; i < list.size(); i++) {
+                        String item = list.get(i);
+                        if (item == null) continue;
+                        for (String t : targets) {
+                          if (t != null && !t.isEmpty() && item.equals(t)) {
+                            list.set(i, replacement);
+                            modified = true;
+                            break;
+                          }
+                        }
+                      }
+                      return modified;
+                    }
+                    
+                    // Safe getter for nested map fields
+                    def getChild(def parent, String child) {
+                      return (parent instanceof Map && parent.containsKey(child)) ? parent[child] : null;
+                    }
+                    
                     String em = params.em;
-                    String[] targetEmails = params.targetEmails;
+                    List targetEmails = params.targetEmails;
                     boolean documentModified = false;
                     
-                    // Helper function to mask specific email in pipe-separated string
-                    def maskEmailInPipeSeparatedString(String fieldValue, String[] targetEmails, String replacement) {
-                        if (fieldValue == null || fieldValue.isEmpty()) {
-                            return fieldValue;
-                        }
-                        
-                        String result = fieldValue;
-                        for (String targetEmail : targetEmails) {
-                            if (targetEmail != null && !targetEmail.isEmpty()) {
-                                // Handle pipe-separated lists: "email1@test.com | email2@test.com | email3@test.com"
-                                if (result.contains(" | ")) {
-                                    // Split by pipe and process each part
-                                    String[] parts = result.split(" \\| ");
-                                    for (int i = 0; i < parts.length; i++) {
-                                        String part = parts[i].trim();
-                                        if (part.equals(targetEmail)) {
-                                            parts[i] = replacement;
-                                        }
-                                    }
-                                    result = String.join(" | ", parts);
-                                } else if (result.equals(targetEmail)) {
-                                    // Single email match
-                                    result = replacement;
-                                }
-                            }
-                        }
-                        return result;
-                    }
-                    
-                    // Mask direct email fields with pipe-separated support
-                    for (String f : params.emailFields) {
-                        if (ctx._source.containsKey(f) && ctx._source[f] != null) {
-                            String originalValue = ctx._source[f].toString();
-                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                            if (!originalValue.equals(maskedValue)) {
-                                ctx._source[f] = maskedValue;
-                                documentModified = true;
-                            }
-                        }
-                    }
-                    
-                    // Mask nested email fields with pipe-separated support
-                    for (String f : params.nestedEmailFields) {
-                        if (ctx._source.containsKey(f) && ctx._source[f] instanceof List) {
-                            for (def item : ctx._source[f]) {
-                                if (item != null) {
-                                    // Process email fields in nested objects
-                                    for (String emailField : ["email", "workerEmail", "lastAnnotatorEmail"]) {
-                                        if (item.containsKey(emailField) && item[emailField] != null) {
-                                            String originalValue = item[emailField].toString();
-                                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                                            if (!originalValue.equals(maskedValue)) {
-                                                item[emailField] = maskedValue;
-                                                documentModified = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Mask history.workerEmail with pipe-separated support
-                    if (ctx._source.containsKey("history") && ctx._source.history != null) {
-                        if (ctx._source.history instanceof List) {
-                            // History is an array - mask workerEmail in each entry
-                            for (int i = 0; i < ctx._source.history.size(); i++) {
-                                def historyEntry = ctx._source.history[i];
-                                if (historyEntry != null) {
-                                    for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
-                                        if (historyEntry.containsKey(emailField) && historyEntry[emailField] != null) {
-                                            String originalValue = historyEntry[emailField].toString();
-                                            String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                                            if (!originalValue.equals(maskedValue)) {
-                                                historyEntry[emailField] = maskedValue;
-                                                documentModified = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // History is a single object
-                            for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
-                                if (ctx._source.history.containsKey(emailField) && ctx._source.history[emailField] != null) {
-                                    String originalValue = ctx._source.history[emailField].toString();
-                                    String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                                    if (!originalValue.equals(maskedValue)) {
-                                        ctx._source.history[emailField] = maskedValue;
-                                        documentModified = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Mask latest email fields with pipe-separated support
+                    // latest.workerEmail
                     if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
-                        for (String emailField : ["workerEmail", "lastAnnotatorEmail", "lastReviewerEmail"]) {
-                            if (ctx._source.latest.containsKey(emailField) && ctx._source.latest[emailField] != null) {
-                                String originalValue = ctx._source.latest[emailField].toString();
-                                String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                                if (!originalValue.equals(maskedValue)) {
-                                    ctx._source.latest[emailField] = maskedValue;
-                                    documentModified = true;
-                                }
-                            }
+                      def orig = getChild(ctx._source.latest, "workerEmail");
+                      if (orig != null) {
+                        List tmp = toList(orig);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source.latest.workerEmail = fromList(orig, tmp);
+                          documentModified = true;
                         }
+                      }
                     }
                     
-                    // Mask earliest email fields with pipe-separated support
+                    // latest.lastAnnotatorEmail
+                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
+                      def orig = getChild(ctx._source.latest, "lastAnnotatorEmail");
+                      if (orig != null) {
+                        List tmp = toList(orig);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source.latest.lastAnnotatorEmail = fromList(orig, tmp);
+                          documentModified = true;
+                        }
+                      }
+                    }
+                    
+                    // latest.lastReviewerEmail
+                    if (ctx._source.containsKey("latest") && ctx._source.latest != null) {
+                      def orig = getChild(ctx._source.latest, "lastReviewerEmail");
+                      if (orig != null) {
+                        List tmp = toList(orig);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source.latest.lastReviewerEmail = fromList(orig, tmp);
+                          documentModified = true;
+                        }
+                      }
+                    }
+                    
+                    // history.workerEmail and history.lastAnnotatorEmail
+                    if (ctx._source.containsKey("history") && ctx._source.history != null) {
+                      def hist = ctx._source.history;
+                      if (hist instanceof List) {
+                        for (def h : hist) {
+                          if (!(h instanceof Map)) continue;
+                          for (String fld : new String[] {"workerEmail","lastAnnotatorEmail"}) {
+                            if (!h.containsKey(fld) || h[fld] == null) continue;
+                            def orig = h[fld];
+                            List tmp = toList(orig);
+                            if (maskEmails(tmp, targetEmails, em)) {
+                              h[fld] = fromList(orig, tmp);
+                              documentModified = true;
+                            }
+                          }
+                        }
+                      } else if (hist instanceof Map) {
+                        for (String fld : new String[] {"workerEmail","lastAnnotatorEmail"}) {
+                          if (!hist.containsKey(fld) || hist[fld] == null) continue;
+                          def orig = hist[fld];
+                          List tmp = toList(orig);
+                          if (maskEmails(tmp, targetEmails, em)) {
+                            hist[fld] = fromList(orig, tmp);
+                            documentModified = true;
+                          }
+                        }
+                      }
+                    }
+                    
+                    // earliest.workerEmail and earliest.lastAnnotatorEmail
                     if (ctx._source.containsKey("earliest") && ctx._source.earliest != null) {
-                        for (String emailField : ["workerEmail", "lastAnnotatorEmail"]) {
-                            if (ctx._source.earliest.containsKey(emailField) && ctx._source.earliest[emailField] != null) {
-                                String originalValue = ctx._source.earliest[emailField].toString();
-                                String maskedValue = maskEmailInPipeSeparatedString(originalValue, targetEmails, em);
-                                if (!originalValue.equals(maskedValue)) {
-                                    ctx._source.earliest[emailField] = maskedValue;
-                                    documentModified = true;
-                                }
-                            }
+                      def orig = getChild(ctx._source.earliest, "workerEmail");
+                      if (orig != null) {
+                        List tmp = toList(orig);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source.earliest.workerEmail = fromList(orig, tmp);
+                          documentModified = true;
                         }
+                      }
+                      
+                      def orig2 = getChild(ctx._source.earliest, "lastAnnotatorEmail");
+                      if (orig2 != null) {
+                        List tmp = toList(orig2);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source.earliest.lastAnnotatorEmail = fromList(orig2, tmp);
+                          documentModified = true;
+                        }
+                      }
                     }
                     
-                    // Only update if document was actually modified
-                    if (!documentModified) {
-                        ctx.op = 'noop';
+                    // Root-level email fields
+                    for (String f : params.emailFields) {
+                      if (f.indexOf(".") >= 0) continue; // nested handled elsewhere
+                      if (ctx._source.containsKey(f) && ctx._source[f] != null) {
+                        def orig = ctx._source[f];
+                        List tmp = toList(orig);
+                        if (maskEmails(tmp, targetEmails, em)) {
+                          ctx._source[f] = fromList(orig, tmp);
+                          documentModified = true;
+                        }
+                      }
                     }
+                    
+                    if (!documentModified) ctx.op = "noop";
                 """,
                 "params": {
                     "em": "deleted_user@deleted.com",
@@ -567,8 +592,7 @@ class ElasticsearchMasking:
                     "emailFields": [
                         "email", "email_address", "worker_email", "lastAnnotatorEmail", 
                         "workerEmail", "qa_checker_email"
-                    ],
-                    "nestedEmailFields": ["history"]
+                    ]
                 }
             }
         }
