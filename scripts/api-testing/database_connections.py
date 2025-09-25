@@ -12,6 +12,9 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
+# Configuration constants
+DISTRIBUTION_SEGMENT_SHARD_COUNT = 10  # Number of sharded distribution segment tables (t0 through t9)
+
 class DatabaseConnections:
     """Manages database connections for the contributor deletion system"""
     
@@ -249,18 +252,8 @@ class DatabaseConnections:
             # These tables contain actual work distribution data
             logger.debug(f"   METHOD 2: Checking distribution segment tables")
             
-            distribution_tables = [
-                'kepler_distribution_segment_t0',
-                'kepler_distribution_segment_t1', 
-                'kepler_distribution_segment_t2',
-                'kepler_distribution_segment_t3',
-                'kepler_distribution_segment_t4',
-                'kepler_distribution_segment_t5',
-                'kepler_distribution_segment_t6',
-                'kepler_distribution_segment_t7',
-                'kepler_distribution_segment_t8',
-                'kepler_distribution_segment_t9'
-            ]
+            # Build distribution tables list dynamically using configurable shard count
+            distribution_tables = [f'kepler_distribution_segment_t{i}' for i in range(DISTRIBUTION_SEGMENT_SHARD_COUNT)]
             
             for table_name in distribution_tables:
                 try:

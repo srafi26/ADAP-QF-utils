@@ -14,6 +14,9 @@ from contributor_deletion_base import ContributorInfo, ThreadSafeCounter
 
 logger = logging.getLogger(__name__)
 
+# Configuration constants
+DISTRIBUTION_SEGMENT_SHARD_COUNT = 10  # Number of sharded distribution segment tables (t0 through t9)
+
 class ElasticsearchMasking:
     """Handles Elasticsearch data masking operations"""
     
@@ -22,6 +25,86 @@ class ElasticsearchMasking:
         self.integration = integration
         self.dry_run = dry_run
         self.elasticsearch_counter = ThreadSafeCounter()
+    
+    def _get_contributor_project_ids_from_db(self, contributor_id: str) -> List[str]:
+        """Get project IDs for a contributor from PostgreSQL using the same method as database_connections.py"""
+        import psycopg2
+        
+        try:
+            # Get database connection details from config
+            db_host = self.config.get('database', 'host', fallback='kepler-pg-integration.cluster-ce52lgdtaew6.us-east-1.rds.amazonaws.com')
+            db_port = self.config.get('database', 'port', fallback='5432')
+            db_name = self.config.get('database', 'name', fallback='kepler-app-db')
+            db_user = self.config.get('database', 'user', fallback='kepler-app-db-id')
+            db_password = self.config.get('database', 'password', fallback='6g3evdSsVVErzGT0ALp7gGwYiccwmZSb')
+            
+            # Connect to database
+            conn = psycopg2.connect(
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                password=db_password
+            )
+            cursor = conn.cursor()
+            project_ids = set()
+            
+            # METHOD 1: Direct contributor-job-project mapping via kepler_proj_job_contributor_t
+            job_project_query = """
+                SELECT DISTINCT pj.project_id
+                FROM kepler_proj_job_contributor_t pjc
+                JOIN kepler_proj_job_t pj ON pjc.job_id = pj.id
+                WHERE pjc.contributor_id = %s
+                AND pj.project_id IS NOT NULL
+                AND pjc.status = 'ACTIVE'
+            """
+            
+            cursor.execute(job_project_query, (contributor_id,))
+            job_project_ids = [row[0] for row in cursor.fetchall() if row[0]]
+            project_ids.update(job_project_ids)
+            
+            # METHOD 2: Check distribution segment tables for additional project associations
+            # Build distribution tables list dynamically (t0 through t9)
+            distribution_tables = [f'kepler_distribution_segment_t{i}' for i in range(10)]
+            
+            for table_name in distribution_tables:
+                try:
+                    # Check if table exists
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_schema = 'public' 
+                            AND table_name = %s
+                        )
+                    """, (table_name,))
+                    
+                    if not cursor.fetchone()[0]:
+                        continue
+                    
+                    # Get distinct project IDs for this contributor
+                    project_query = f"""
+                        SELECT DISTINCT project_id 
+                        FROM {table_name} 
+                        WHERE (worker_id = %s OR last_annotator = %s)
+                        AND project_id IS NOT NULL
+                    """
+                    
+                    cursor.execute(project_query, (contributor_id, contributor_id))
+                    table_project_ids = [row[0] for row in cursor.fetchall() if row[0]]
+                    project_ids.update(table_project_ids)
+                    
+                except Exception as table_error:
+                    logger.debug(f"   Error analyzing {table_name}: {table_error}")
+                    continue
+            
+            cursor.close()
+            conn.close()
+            
+            return list(project_ids)
+            
+        except Exception as e:
+            logger.error(f"Error getting project IDs from database: {e}")
+            return []
     
     def mask_elasticsearch_data(self, contributors: List[ContributorInfo]) -> int:
         """Mask contributor data in Elasticsearch using comprehensive approach that always includes fallback"""
@@ -62,9 +145,8 @@ class ElasticsearchMasking:
             
             logger.info("🔍 Collecting project IDs for all contributors...")
             for contributor in contributors:
-                # Note: This would need to be injected from the main class
-                # project_ids = self.get_contributor_project_ids(contributor.contributor_id)
-                project_ids = []  # Placeholder - would be injected
+                # Get project IDs from database using the same method as the main script
+                project_ids = self._get_contributor_project_ids_from_db(contributor.contributor_id)
                 all_project_ids.update(project_ids)
                 contributor_data[contributor.contributor_id] = {
                     'email': contributor.email_address,
